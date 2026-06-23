@@ -124,6 +124,19 @@ it stops wasting quantity on bins that can't fill. On illiquid names that lifts
 the fill rate substantially (in the demo, the illiquid contract goes from ~78%
 filled under TWAP to ~100% under VWAP).
 
+A full fill is **not** guaranteed, though — VWAP only spreads the order over bins
+that actually traded, so it still under-fills when the order is larger than the
+day can absorb (`quantity > 2 × total daily volume`, since each bin caps at
+`2 × volume`), on zero-volume days (it falls back to an even split that fills
+nothing), or in the rare bins that have volume but missing price data. The demo
+orders are sized well within each instrument's daily liquidity, which is why they
+happen to fill completely.
+
+Because the schedule is built from the `volume` of the bins for one
+`(security, date)` — and the data carries exactly one front-month contract per
+`(qcode, date)` — **each instrument gets its own schedule from its own volume
+curve**, and the same instrument gets a different schedule on different days.
+
 This is a *realised*-volume VWAP — it uses the actual volume of the day being
 executed (perfect hindsight of the profile). A forecast-based VWAP, using the
 historical average profile per instrument (the per-`qcode` profile computed in
