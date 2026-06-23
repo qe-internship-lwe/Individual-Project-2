@@ -11,6 +11,7 @@ which carries the bulk of the schedule-building and back-testing logic::
     from execution import (
         simulate_bin_fill,        # scalar reference model (one bin)
         twap_schedule,            # baseline strategy: even split across bins
+        vwap_schedule,            # baseline strategy: split by each bin's volume share
         run_strategy,             # run one order (security, date, side, qty)
         run_trade_list,           # run many orders (the trade list)
         summarise_fills,          # order-level metrics: fill rate, IS, cost
@@ -20,8 +21,8 @@ The layering is:
 
 * :func:`simulate_bin_fill` - scalar, single-bin reference implementation of
   the fill model (no dependencies beyond the stdlib).
-* a *strategy* (e.g. :func:`twap_schedule`) - maps a day's bins + a total
-  quantity to a per-bin requested quantity.
+* a *strategy* (e.g. :func:`twap_schedule`, :func:`vwap_schedule`) - maps a
+  day's bins + a total quantity to a per-bin requested quantity.
 * :func:`run_strategy` - applies a strategy to one (security, date) order and
   simulates the fills **vectorised** (polars), returning one row per bin.
 * :func:`run_trade_list` - loops :func:`run_strategy` over many orders.
@@ -68,6 +69,7 @@ __all__ = [
     "BinFill",
     "simulate_bin_fill",
     "twap_schedule",
+    "vwap_schedule",
     "run_strategy",
     "run_trade_list",
     "summarise_fills",
@@ -362,6 +364,74 @@ def twap_schedule(bins: pl.DataFrame, quantity: float, **_: object) -> pl.Series
         return pl.Series("q_requested", [], dtype=pl.Float64)
     per_bin = float(quantity) / n
     return pl.Series("q_requested", [per_bin] * n, dtype=pl.Float64)
+
+
+def vwap_schedule(bins: pl.DataFrame, quantity: float, **_: object) -> pl.Series:
+    """Baseline VWAP schedule: split ``quantity`` by each bin's volume share.
+
+    Volume-Weighted Average Price. Each bin is requested in proportion to the
+    fraction of the **day's** total traded volume that occurred in that bin::
+
+        q_requested[i] = quantity * volume[i] / sum(volume)
+
+    So if a bin carried 3% of the day's volume it is asked to trade 3% of the
+    order. This tracks the realised intraday volume profile (the U-shape seen in
+    ``test_snowflake.ipynb``): heavy bins at the open/close get more, thin
+    midday bins get less.
+
+    How it differs from :func:`twap_schedule`:
+
+    * It allocates **nothing** to zero-volume bins (their share is 0), so it
+      stops wasting quantity on bins that cannot fill - the main weakness of
+      naive TWAP. It still requests proportionally more in heavy bins, which can
+      bump into the ``2 * volume`` fill cap, but those are exactly the liquid
+      bins where the cap is least binding.
+    * This is a *realised*-volume VWAP: it uses the actual ``volume`` of the day
+      being executed (perfect hindsight of the profile). A forecast-based VWAP
+      (using the historical average profile per qcode) would be the next step.
+
+    Parameters
+    ----------
+    bins : pl.DataFrame
+        The bins for one (security, date); must contain the ``volume`` column.
+        Only ``volume`` is used; the caller (:func:`run_strategy`) sorts by time.
+    quantity : float
+        Total quantity to execute over the day (a magnitude; ``side`` is
+        handled by the runner).
+    **_ :
+        Ignored. Present so strategies share a uniform calling convention.
+
+    Returns
+    -------
+    pl.Series
+        Float series of length ``len(bins)`` summing to ``quantity``. When the
+        day has **no** traded volume at all (``sum(volume) <= 0``, e.g. a fully
+        dead day), the proportions are undefined and it falls back to an even
+        TWAP split so the order is still fully requested (nothing fills either
+        way, since every bin is a no-trade bin).
+
+    Examples
+    --------
+    >>> import polars as pl
+    >>> b = pl.DataFrame({
+    ...     "bin_start_time": ["09:00", "09:05", "09:10"],
+    ...     "volume": [100, 0, 50],          # middle bin is a no-trade bin
+    ... })
+    >>> [round(x, 2) for x in vwap_schedule(b, 300)]   # shares 2/3, 0, 1/3
+    [200.0, 0.0, 100.0]
+    """
+    n = bins.height
+    if n == 0:
+        return pl.Series("q_requested", [], dtype=pl.Float64)
+
+    vol = bins.get_column(VOLUME_COL).cast(pl.Float64).fill_null(0.0).fill_nan(0.0)
+    total = vol.sum()
+    if total is None or total <= 0:
+        # No traded volume anywhere -> fall back to an even split.
+        per_bin = float(quantity) / n
+        return pl.Series("q_requested", [per_bin] * n, dtype=pl.Float64)
+
+    return (vol / total * float(quantity)).rename("q_requested")
 
 
 def _simulate_fills_df(df: pl.DataFrame, *, side_col: str = "side",

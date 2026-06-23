@@ -1,0 +1,186 @@
+# Trade Execution
+
+A back-testing harness for **execution strategies** on front-month futures. It
+takes a list of orders, simulates how each one would have filled if executed
+across a trading day, and reports how good that execution was (fill rate, cost,
+implementation shortfall).
+
+The goal is to have a common framework where different execution strategies can
+be plugged in and measured on the same orders and the same market data. Today
+there is one strategy — **TWAP** (the naive baseline). Smarter strategies will
+be added and compared against it later.
+
+The reusable logic lives in [`execution.py`](execution.py); the
+[`trade_execution.ipynb`](trade_execution.ipynb) notebook is the driver that
+loads data, runs strategies, and inspects the results.
+
+---
+
+## The big picture
+
+```
+ orders (trade_list)          market data (binned_data)
+        │                              │
+        └──────────────┬───────────────┘
+                       ▼
+                 a strategy          ← decides how much to trade in each 5-min bin
+                       ▼
+                 fill model          ← simulates what actually fills, and at what price
+                       ▼
+              per-bin fill rows
+                       ▼
+              summarise_fills        ← one row per order: fill rate, cost, shortfall
+```
+
+The day is split into **5-minute bins**. A strategy decides *how much of the
+order to send in each bin*; the fill model then decides *how much of that
+actually trades and at what price*, given the bin's liquidity. Collapsing all
+the bins back to one row per order gives the execution-quality scorecard.
+
+---
+
+## Inputs
+
+### Orders — the trade list
+
+Each order is one **(security, date, side, quantity)** to execute over a single
+day. The orders come from a `TRADE_LIST` table that holds **six orders per
+security-day**, one for each combination of size bucket × side:
+
+| | buy | sell |
+|---|---|---|
+| **small** | `small_buys` | `small_sells` |
+| **medium** | `medium_buys` | `medium_sells` |
+| **large** | `large_buys` | `large_sells` |
+
+You typically back-test **one bucket at a time** (e.g. all `medium_buys`), so
+results are comparable within a size/side regime.
+
+### Market data — the bins
+
+For each instrument and day, the market is described in 5-minute bins. Each bin
+carries the microstructure the fill model needs:
+
+- **volume** — contracts traded in the bin (the liquidity available),
+- **VWAP** — volume-weighted average price (the reference fill price),
+- **TWA ask / TWA bid** — time-weighted average quotes (their difference is the
+  spread),
+- **open** — the bin's opening price (used as the pre-trade benchmark).
+
+Some bins are structurally dead — zero volume or missing data. Nothing can fill
+in those bins, which is exactly the friction a good strategy has to work around.
+
+---
+
+## The fill model
+
+For a single bin, given how much the strategy asked to trade:
+
+1. **You can't take the whole bin.** Fills are capped at **twice the bin's
+   volume** — you can trade at most `2 × volume` no matter how much you ask for.
+   Anything above the cap is left unfilled.
+2. **Trading moves the price against you.** The more of the bin's volume you
+   take (your *participation rate*), the worse your price. This is modelled as a
+   **square-root slippage** function: small participation barely moves you off
+   VWAP; pushing all the way to the cap costs you roughly **half the spread**.
+3. **Direction sets the sign.** Buys pay *up* from VWAP (VWAP + slippage);
+   sells get hit *down* (VWAP − slippage).
+4. **No data, no fill.** If a bin is missing any of volume / VWAP / ask / bid,
+   or has zero volume, it produces no fill and the requested quantity is left
+   over.
+
+Unfilled quantity is **not** automatically retried — it's reported so a strategy
+can decide whether to re-queue it. The baseline TWAP does not, so under-filling
+in illiquid names shows up directly in its score.
+
+---
+
+## Strategies
+
+A strategy answers one question: **given a day's bins and a total quantity, how
+much should be requested in each bin?** Everything else (the fill model, the
+metrics) is shared, so swapping strategies is the only variable when comparing.
+
+### TWAP (Time-Weighted Average Price) — the baseline
+
+Splits the order **evenly across every bin** in the day — each bin requests
+`quantity / number_of_bins`, regardless of that bin's liquidity.
+
+This is deliberately naive. It allocates to dead bins too, so that quantity
+simply never fills and is lost. That under-filling on illiquid or short days is
+the weakness a smarter, liquidity-aware schedule should improve on — and the
+reason TWAP is the baseline everything else is measured against.
+
+### VWAP (Volume-Weighted Average Price) — the volume-aware baseline
+
+Splits the order across bins **in proportion to each bin's share of the day's
+traded volume**: a bin that carried 3% of the day's volume is asked to trade 3%
+of the order (`quantity × volume / total_volume`). This tracks the intraday
+volume profile — heavy at the open/close, thin midday — instead of treating
+every bin equally.
+
+The key difference from TWAP: it allocates **nothing** to zero-volume bins, so
+it stops wasting quantity on bins that can't fill. On illiquid names that lifts
+the fill rate substantially (in the demo, the illiquid contract goes from ~78%
+filled under TWAP to ~100% under VWAP).
+
+This is a *realised*-volume VWAP — it uses the actual volume of the day being
+executed (perfect hindsight of the profile). A forecast-based VWAP, using the
+historical average profile per instrument (the per-`qcode` profile computed in
+[`test_snowflake.ipynb`](test_snowflake.ipynb)), would be the natural next step.
+
+> More strategies will be documented here as they are added.
+
+---
+
+## Outputs — what gets measured
+
+Each order collapses to a single row of execution metrics. At a glance:
+
+- **`fill_rate`** — fraction of the order that actually got done. Below 1 means
+  the cap / illiquidity blocked you.
+- **`participation_overall`** — your share of total market volume over the day
+  (how aggressive the execution was).
+- **`avg_fill_price`** — the volume-weighted price you actually transacted at.
+- **`total_cost`** — pure spread friction paid, always ≥ 0.
+- **`exec_slippage_bps`** — slippage of the filled portion vs the pre-trade
+  benchmark price, in basis points, **signed so positive = worse**. Includes
+  both spread and intraday price drift.
+- **`is_bps`** — **implementation shortfall**: the all-in score. Like
+  `exec_slippage_bps` but *also* charges opportunity cost on whatever didn't
+  fill. This is the metric that punishes a low fill rate, so it's the natural
+  top-line number when comparing strategies.
+
+The benchmark (the "arrival price" these are measured against) is the **open of
+the first bin** — the decision price before any trading happens.
+
+> **Full column-by-column reference:** see
+> [`docs/execution_metrics.md`](docs/execution_metrics.md). It documents every
+> field `summarise_fills` produces and, importantly, explains how the three
+> "quality" numbers (`total_cost`, `exec_slippage_bps`, `is_bps`) differ.
+
+*(Cross-strategy comparison and evaluation are out of scope for now — we're
+still building the strategies, not yet ranking them.)*
+
+---
+
+## Where things live
+
+| File | Role |
+|---|---|
+| [`execution.py`](execution.py) | All reusable logic — fill model, strategies, runners, metrics. |
+| [`trade_execution.ipynb`](trade_execution.ipynb) | Driver: loads data, runs strategies, inspects results. |
+| [`docs/execution_metrics.md`](docs/execution_metrics.md) | Detailed reference for every output metric. |
+| [`docs/qcode_mapping.md`](docs/qcode_mapping.md) | Reference for the instrument dimension table. |
+
+---
+
+## Keeping this in sync
+
+This README is the **high-level overview**. When the execution logic changes,
+update it alongside the docstrings — in particular:
+
+- a **new strategy** → add it under [Strategies](#strategies),
+- a **change to the fill model** → update [The fill model](#the-fill-model),
+- a **new or changed metric** → update both [Outputs](#outputs--what-gets-measured)
+  here and the detailed table in [`docs/execution_metrics.md`](docs/execution_metrics.md).
