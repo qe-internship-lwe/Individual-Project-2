@@ -63,6 +63,7 @@ from __future__ import annotations
 import math
 from typing import Callable, NamedTuple, Optional, Sequence
 
+import numpy as np
 import polars as pl
 
 __all__ = [
@@ -70,6 +71,10 @@ __all__ = [
     "simulate_bin_fill",
     "twap_schedule",
     "vwap_schedule",
+    "build_liq_spread_curves",
+    "vwap_static",
+    "liq_spr_static",
+    "omniscient",
     "run_strategy",
     "run_trade_list",
     "summarise_fills",
@@ -320,20 +325,33 @@ Strategy = Callable[..., Sequence[float]]
 
 
 def twap_schedule(bins: pl.DataFrame, quantity: float, **_: object) -> pl.Series:
-    """Baseline TWAP schedule: split ``quantity`` evenly across every bin.
+    """Baseline TWAP schedule: split ``quantity`` evenly across every bin in
+    **whole lots**.
 
-    Time-Weighted Average Price. The total order quantity is divided equally
-    over all bins present for the (security, date), so each bin requests
-    ``quantity / n_bins`` regardless of that bin's volume or liquidity.
+    Time-Weighted Average Price. We cannot trade fractional lots, only round
+    lots, so the total order quantity ``X`` (rounded to an integer number of
+    lots) is split across the ``N`` bins of the (security, date) using a
+    two-layer integer decomposition:
 
-    This is the naive baseline on purpose:
+    * **Floor quotient (base layer).** ``B = X // N`` is the minimum integer
+      number of lots every single bin is guaranteed to execute.
+    * **Modulo remainder (remainder layer).** ``R = X % N`` is the leftover
+      lots that do not divide evenly. By construction ``0 <= R < N``, so the
+      remainder is dealt out as one extra lot to the first ``R`` bins (one
+      lot each, never more). The earliest bins are favoured so the residual
+      is worked off promptly rather than left to the end of the day.
+
+    The result is ``R`` bins of ``B + 1`` lots followed by ``N - R`` bins of
+    ``B`` lots, which sums to ``R*(B+1) + (N-R)*B = N*B + R = X`` exactly - the
+    order is fully scheduled with no fractional lots anywhere.
+
+    This is still the naive baseline on purpose:
 
     * It allocates to **every** bin in the day, including bins that cannot fill
-      (zero-volume / missing-data bins). Quantity assigned to those bins simply
-      does not fill and is lost (no auto-retry), so the realised fill rate will
-      be below 100% in illiquid names - which is exactly what we want to
-      measure a smarter strategy against.
-    * It does not round to integer lots; requested quantities may be fractional.
+      (zero-volume / missing-data bins). Lots assigned to those bins simply do
+      not fill and are lost (no auto-retry), so the realised fill rate will be
+      below 100% in illiquid names - which is exactly what we want to measure a
+      smarter strategy against.
 
     Parameters
     ----------
@@ -341,43 +359,61 @@ def twap_schedule(bins: pl.DataFrame, quantity: float, **_: object) -> pl.Series
         The bins for one (security, date). Only the row count is used; the
         caller (:func:`run_strategy`) is responsible for sorting by time.
     quantity : float
-        Total quantity to execute over the day (a magnitude; ``side`` is
-        handled by the runner).
+        Total quantity to execute over the day (a magnitude in lots; ``side``
+        is handled by the runner). Rounded to the nearest whole lot before
+        splitting, since only round lots can be traded.
     **_ :
         Ignored. Present so strategies share a uniform calling convention.
 
     Returns
     -------
     pl.Series
-        Float series of length ``len(bins)`` summing to ``quantity``; every
-        element equals ``quantity / len(bins)``.
+        Integer-valued float series of length ``len(bins)`` summing to the
+        rounded ``quantity``; each element is either ``B`` or ``B + 1`` lots.
 
     Examples
     --------
     >>> import polars as pl
     >>> b = pl.DataFrame({"bin_start_time": ["09:00", "09:05", "09:10", "09:15"]})
-    >>> list(twap_schedule(b, 1000))
+    >>> list(twap_schedule(b, 1000))          # 1000 / 4 divides evenly
     [250.0, 250.0, 250.0, 250.0]
+    >>> list(twap_schedule(b, 1002))          # B=250, R=2 -> first 2 bins get +1
+    [251.0, 251.0, 250.0, 250.0]
     """
     n = bins.height
     if n == 0:
         return pl.Series("q_requested", [], dtype=pl.Float64)
-    per_bin = float(quantity) / n
-    return pl.Series("q_requested", [per_bin] * n, dtype=pl.Float64)
+    total_lots = int(round(float(quantity)))      # only whole lots can be traded
+    base = total_lots // n                         # floor quotient (base layer)
+    remainder = total_lots % n                     # modulo remainder (0 <= R < n)
+    per_bin = [base + 1 if i < remainder else base for i in range(n)]
+    return pl.Series("q_requested", per_bin, dtype=pl.Float64)
 
 
 def vwap_schedule(bins: pl.DataFrame, quantity: float, **_: object) -> pl.Series:
     """Baseline VWAP schedule: split ``quantity`` by each bin's volume share.
 
     Volume-Weighted Average Price. Each bin is requested in proportion to the
-    fraction of the **day's** total traded volume that occurred in that bin::
+    fraction of the **day's** total traded volume that occurred in that bin, but
+    in **whole lots** only (we cannot trade fractional lots). The ideal
+    continuous target for bin ``k`` is::
 
-        q_requested[i] = quantity * volume[i] / sum(volume)
+        q_k* = X * volume[k] / sum(volume)
 
-    So if a bin carried 3% of the day's volume it is asked to trade 3% of the
-    order. This tracks the realised intraday volume profile (the U-shape seen in
-    ``test_snowflake.ipynb``): heavy bins at the open/close get more, thin
-    midday bins get less.
+    where ``X`` is the order quantity rounded to whole lots. Naively rounding
+    each ``q_k*`` independently would not sum back to ``X``. Instead we use
+    **cumulative rounding** (a.k.a. the largest-remainder method written as a
+    running total), which is self-correcting and guarantees the integer vector
+    sums exactly to ``X``:
+
+    1. Cumulative ideal float target up to bin ``k``: ``Q_k* = sum_{i<=k} q_i*``.
+    2. Cumulative integer goal: ``Qbar_k = round(Q_k*)``.
+    3. Requested integer lots for bin ``k``: ``q_k = Qbar_k - Qbar_{k-1}``
+       (with ``Qbar_0 = 0``).
+
+    Because ``Q_N* = X`` exactly and ``X`` is an integer, ``Qbar_N = X``, so the
+    requested vector telescopes to ``X``. Any fractional dust a bin would have
+    carried is pushed onto the next bin's cumulative goal rather than dropped.
 
     How it differs from :func:`twap_schedule`:
 
@@ -396,19 +432,21 @@ def vwap_schedule(bins: pl.DataFrame, quantity: float, **_: object) -> pl.Series
         The bins for one (security, date); must contain the ``volume`` column.
         Only ``volume`` is used; the caller (:func:`run_strategy`) sorts by time.
     quantity : float
-        Total quantity to execute over the day (a magnitude; ``side`` is
-        handled by the runner).
+        Total quantity to execute over the day (a magnitude in lots; ``side`` is
+        handled by the runner). Rounded to the nearest whole lot before
+        splitting, since only round lots can be traded.
     **_ :
         Ignored. Present so strategies share a uniform calling convention.
 
     Returns
     -------
     pl.Series
-        Float series of length ``len(bins)`` summing to ``quantity``. When the
-        day has **no** traded volume at all (``sum(volume) <= 0``, e.g. a fully
-        dead day), the proportions are undefined and it falls back to an even
-        TWAP split so the order is still fully requested (nothing fills either
-        way, since every bin is a no-trade bin).
+        Integer-valued float series of length ``len(bins)`` summing exactly to
+        the rounded ``quantity``. When the day has **no** traded volume at all
+        (``sum(volume) <= 0``, e.g. a fully dead day), the proportions are
+        undefined and it falls back to the integer-lot TWAP split so the order
+        is still fully requested (nothing fills either way, since every bin is a
+        no-trade bin).
 
     Examples
     --------
@@ -419,19 +457,407 @@ def vwap_schedule(bins: pl.DataFrame, quantity: float, **_: object) -> pl.Series
     ... })
     >>> [round(x, 2) for x in vwap_schedule(b, 300)]   # shares 2/3, 0, 1/3
     [200.0, 0.0, 100.0]
+    >>> list(vwap_schedule(b, 301))          # cumulative rounding keeps the sum
+    [201.0, 0.0, 100.0]
     """
     n = bins.height
     if n == 0:
         return pl.Series("q_requested", [], dtype=pl.Float64)
 
+    total_lots = int(round(float(quantity)))      # only whole lots can be traded
     vol = bins.get_column(VOLUME_COL).cast(pl.Float64).fill_null(0.0).fill_nan(0.0)
     total = vol.sum()
     if total is None or total <= 0:
-        # No traded volume anywhere -> fall back to an even split.
-        per_bin = float(quantity) / n
-        return pl.Series("q_requested", [per_bin] * n, dtype=pl.Float64)
+        # No traded volume anywhere -> fall back to the integer-lot even split.
+        return twap_schedule(bins, total_lots)
 
-    return (vol / total * float(quantity)).rename("q_requested")
+    # Cumulative rounding: round the running ideal target, then difference it so
+    # the per-bin integer lots telescope back to exactly ``total_lots``.
+    cum_ideal = (vol / total * total_lots).cum_sum()
+    cum_goal = cum_ideal.round(0)
+    per_bin = cum_goal.diff().fill_null(cum_goal.head(1))
+    return per_bin.cast(pl.Float64).rename("q_requested")
+
+
+# --- liq_spr_static: cost-minimising allocation over static historical curves ---
+#
+# The fill model charges, per bin, ``cost = slippage_factor * spread * q`` with
+# ``slippage_factor = SLIPPAGE_BASE + SLIPPAGE_COEF * sqrt(q / V)``. Expanding:
+#
+#     C_k(q_k) = SLIPPAGE_BASE * s_k * q_k
+#              + SLIPPAGE_COEF * s_k * q_k**1.5 / sqrt(V_k)
+#
+# We minimise total cost sum_k C_k(q_k) subject to sum_k q_k = X, q_k >= 0. Each
+# C_k is convex (q**1.5 is convex), so the equal-marginal-cost (KKT) point is the
+# unique global optimum. The marginal cost is
+#
+#     dC_k/dq_k = SLIPPAGE_BASE * s_k + MARG_COEF * s_k * sqrt(q_k / V_k) = mu
+#
+# with MARG_COEF = 1.5 * SLIPPAGE_COEF. Inverting for a common multiplier ``mu``:
+#
+#     q_k*(mu) = V_k * max(0, mu / (MARG_COEF * s_k) - THRESH_RATIO)**2
+#
+# where THRESH_RATIO = SLIPPAGE_BASE / MARG_COEF. The ``max(0, .)`` is the
+# non-negativity clamp: a bin trades only once mu exceeds its first-lot marginal
+# cost SLIPPAGE_BASE * s_k; below that, q_k = 0 (squaring a negative bracket
+# would wrongly load quantity into expensive bins). Note that with equal spreads
+# the bracket is constant across bins and q_k* proportional to V_k -> plain VWAP,
+# so this is a spread-aware generalisation of VWAP.
+MARG_COEF: float = 1.5 * SLIPPAGE_COEF          # 0.4242: slope of the sqrt term
+THRESH_RATIO: float = SLIPPAGE_BASE / MARG_COEF  # 0.2357: SLIPPAGE_BASE / MARG_COEF
+
+
+def build_liq_spread_curves(bins: pl.DataFrame) -> dict:
+    """Precompute the static per-(security, bin) spread and liquidity curves.
+
+    For each ``(security, bin_start_time)`` this averages, over **all days** in
+    ``bins``:
+
+    * ``spread_curve`` ``s_k`` = mean of ``twa_ask - twa_bid``;
+    * ``liq_curve``    ``V_k`` = mean of ``volume``.
+
+    Nulls are skipped by the mean (a bin missing prices on some days still gets a
+    curve from the days it has). These are *static* (historical) profiles - they
+    do not use the day being executed, so :func:`liq_spr_static` is lookahead-free
+    (unlike the realised-volume :func:`vwap_schedule`).
+
+    Parameters
+    ----------
+    bins : pl.DataFrame
+        Bins to estimate the curves from (typically the full ``BINNED_DATA``),
+        with the ``security``, ``bin_start_time``, ``volume``, ``twa_ask`` and
+        ``twa_bid`` columns.
+
+    Returns
+    -------
+    dict
+        Nested lookup ``{security: {bin_start_time: (s_k, V_k)}}`` for O(1) access
+        per bin inside the strategy. Pass it as
+        ``strategy_params={"curves": curves}`` to :func:`run_strategy` /
+        :func:`run_trade_list`.
+    """
+    g = (
+        bins.select(SECURITY_COL, BIN_TIME_COL, VOLUME_COL, ASK_COL, BID_COL)
+        .with_columns((pl.col(ASK_COL) - pl.col(BID_COL)).alias("_spread"))
+        .group_by(SECURITY_COL, BIN_TIME_COL)
+        .agg(
+            pl.col("_spread").mean().alias("spread_curve"),
+            pl.col(VOLUME_COL).cast(pl.Float64).mean().alias("liq_curve"),
+        )
+    )
+    curves: dict = {}
+    for sec, bt, s_k, v_k in g.iter_rows():
+        curves.setdefault(sec, {})[bt] = (s_k, v_k)
+    return curves
+
+
+def vwap_static(bins: pl.DataFrame, quantity: float, *,
+                curves: dict, **_: object) -> pl.Series:
+    """VWAP weighted by the **static historical** volume curve (no lookahead).
+
+    Like :func:`vwap_schedule`, this splits the order in proportion to each bin's
+    volume share - but it uses the average per-(security, bin) volume ``V_k`` from
+    :func:`build_liq_spread_curves` (the mean over all days) instead of the day's
+    *realised* volume. That removes the perfect-hindsight assumption baked into
+    :func:`vwap_schedule`, so this is the deployable VWAP baseline and the fair
+    head-to-head for :func:`liq_spr_static` (both run off the same static
+    ``curves``)::
+
+        q_requested[k] = quantity * V_k / sum(V_k)
+
+    Quantities are rounded to whole lots by the same cumulative-rounding scheme
+    as :func:`vwap_schedule`, so they sum exactly to ``round(quantity)``.
+
+    Parameters
+    ----------
+    bins : pl.DataFrame
+        Bins for one (security, date); must carry ``security`` and
+        ``bin_start_time``. Aligned to the caller's (time-sorted) row order.
+    quantity : float
+        Total lots to execute (rounded to whole lots).
+    curves : dict
+        ``{security: {bin_start_time: (s_k, V_k)}}`` from
+        :func:`build_liq_spread_curves`, passed via ``strategy_params``. Only the
+        ``V_k`` (volume) component is used.
+    **_ :
+        Ignored. Present so strategies share a uniform calling convention.
+
+    Returns
+    -------
+    pl.Series
+        Integer-valued float series of length ``len(bins)`` summing to
+        ``round(quantity)``. When no bin has a usable historical volume, falls
+        back to the integer-lot TWAP split.
+    """
+    n = bins.height
+    if n == 0:
+        return pl.Series("q_requested", [], dtype=pl.Float64)
+
+    total_lots = int(round(float(quantity)))
+    if total_lots <= 0:
+        return pl.Series("q_requested", [0.0] * n, dtype=pl.Float64)
+
+    per_bin = curves.get(bins.get_column(SECURITY_COL)[0], {})
+    times = bins.get_column(BIN_TIME_COL).to_list()
+    vol = pl.Series(
+        [per_bin.get(t, (None, 0.0))[1] or 0.0 for t in times], dtype=pl.Float64
+    ).fill_nan(0.0).clip(lower_bound=0.0)
+
+    total = vol.sum()
+    if total is None or total <= 0:
+        # No historical volume for this security/day -> even-split fallback.
+        return twap_schedule(bins, total_lots)
+
+    # Cumulative rounding (same as vwap_schedule): the per-bin integer lots
+    # telescope back to exactly ``total_lots``.
+    cum_goal = (vol / total * total_lots).cum_sum().round(0)
+    per_bin_lots = cum_goal.diff().fill_null(cum_goal.head(1))
+    return per_bin_lots.cast(pl.Float64).rename("q_requested")
+
+
+def _solve_mu(total_lots: int, s: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Continuous cost-optimal per-bin quantities summing to ``total_lots``.
+
+    ``s`` and ``v`` are the per-bin spread/liquidity for the **active** bins only
+    (finite ``s > 0`` and ``v > 0``). Solves ``sum_k q_k*(mu) = total_lots`` for
+    the Lagrange multiplier ``mu`` by bisection - ``q_k*(mu)`` is non-decreasing
+    in ``mu``, so the total is monotone and bisection is exact to tolerance.
+    Returns the continuous ``q_k*`` (not yet rounded) for those active bins.
+    """
+    def q_of(mu: float) -> np.ndarray:
+        bracket = np.maximum(0.0, mu / (MARG_COEF * s) - THRESH_RATIO)
+        return v * bracket * bracket
+
+    # Upper bound: grow mu until the achievable total reaches the target.
+    mu_hi = max(SLIPPAGE_BASE * float(s.max()) * 2.0, 1e-9)
+    for _ in range(200):
+        if q_of(mu_hi).sum() >= total_lots:
+            break
+        mu_hi *= 2.0
+    mu_lo = 0.0
+    for _ in range(100):
+        mid = 0.5 * (mu_lo + mu_hi)
+        if q_of(mid).sum() < total_lots:
+            mu_lo = mid
+        else:
+            mu_hi = mid
+    return q_of(mu_hi)
+
+
+def _largest_remainder_round(q: np.ndarray, total_lots: int) -> np.ndarray:
+    """Round a continuous allocation to whole lots summing exactly to ``total``.
+
+    Floors every bin, then deals the leftover ``total - sum(floor)`` lots one each
+    to the bins with the largest fractional remainders (the standard
+    largest-remainder method). Zero-allocation bins keep their integer 0.
+    """
+    floor = np.floor(q)
+    frac = q - floor
+    out = floor.astype(np.int64)
+    remainder = int(total_lots - out.sum())
+    if remainder > 0:
+        # earliest bins break ties (stable sort) so the result is deterministic
+        order = np.argsort(-frac, kind="stable")
+        out[order[:remainder]] += 1
+    elif remainder < 0:
+        # defensive: overshoot shouldn't happen, but peel lots off the smallest
+        # fractions among bins that still hold >= 1 lot.
+        eligible = np.where(out > 0)[0]
+        order = eligible[np.argsort(frac[eligible], kind="stable")]
+        out[order[: -remainder]] -= 1
+    return out
+
+
+def liq_spr_static(bins: pl.DataFrame, quantity: float, *,
+                   curves: dict, **_: object) -> pl.Series:
+    """Cost-minimising schedule over static historical spread/liquidity curves.
+
+    Chooses the per-bin lots ``q_k`` that **minimise the fill model's total
+    slippage cost** for this order, using the static per-(security, bin) curves
+    from :func:`build_liq_spread_curves` (so it uses no information from the day
+    being executed). With equal spreads across bins this reduces to VWAP; the
+    spread term tilts allocation toward tight-spread, liquid bins.
+
+    The continuous optimum is ``q_k*(mu) = V_k * max(0, mu/(MARG_COEF*s_k) -
+    THRESH_RATIO)**2`` with ``mu`` solved so the bins sum to ``round(quantity)``
+    (see module notes above :func:`build_liq_spread_curves`). The result is then
+    rounded to whole lots by the largest-remainder method, summing exactly to the
+    order. No ``2*V`` fill cap is imposed (pure cost minimisation); the convex
+    cost already discourages over-concentration.
+
+    Parameters
+    ----------
+    bins : pl.DataFrame
+        Bins for one (security, date); must carry ``security`` and
+        ``bin_start_time``. Aligned to the caller's (time-sorted) row order.
+    quantity : float
+        Total lots to execute (rounded to whole lots).
+    curves : dict
+        ``{security: {bin_start_time: (s_k, V_k)}}`` from
+        :func:`build_liq_spread_curves`, passed via ``strategy_params``.
+    **_ :
+        Ignored. Present so strategies share a uniform calling convention.
+
+    Returns
+    -------
+    pl.Series
+        Integer-valued float series of length ``len(bins)`` summing to
+        ``round(quantity)``. Bins with no historical liquidity/spread get 0; if
+        **no** bin has a usable curve, falls back to the integer-lot TWAP split.
+    """
+    n = bins.height
+    if n == 0:
+        return pl.Series("q_requested", [], dtype=pl.Float64)
+
+    total_lots = int(round(float(quantity)))
+    if total_lots <= 0:
+        return pl.Series("q_requested", [0.0] * n, dtype=pl.Float64)
+
+    security = bins.get_column(SECURITY_COL)[0]
+    per_bin = curves.get(security, {})
+    times = bins.get_column(BIN_TIME_COL).to_list()
+    s = np.array([per_bin.get(t, (np.nan, 0.0))[0] for t in times], dtype=float)
+    v = np.array([per_bin.get(t, (np.nan, 0.0))[1] for t in times], dtype=float)
+
+    active = np.isfinite(s) & (s > 0) & np.isfinite(v) & (v > 0)
+    if not active.any():
+        # No historical curve for this security/day -> safe even-split fallback.
+        return twap_schedule(bins, total_lots)
+
+    q_cont = _solve_mu(total_lots, s[active], v[active])
+    q_full = np.zeros(n, dtype=float)
+    q_full[active] = q_cont
+    q_int = _largest_remainder_round(q_full, total_lots)
+    return pl.Series("q_requested", q_int.astype(float), dtype=pl.Float64)
+
+
+def _solve_omniscient_q(total_lots: int, base: np.ndarray, s: np.ndarray,
+                        v: np.ndarray) -> np.ndarray:
+    """Continuous cost-optimal per-bin quantities for the omniscient strategy.
+
+    Solves ``sum_k q_k(mu) = total_lots`` by bisection, where each bin is both
+    floored at 0 and **capped at the fill limit** ``2 * v_k``::
+
+        q_k(mu) = min( v_k * max(0, (mu - base_k - SLIPPAGE_BASE*s_k)
+                                     / (MARG_COEF*s_k))**2 , 2*v_k )
+
+    ``base_k = sign * vwap_k`` carries the (signed) price term. ``q_k(mu)`` is
+    non-decreasing in ``mu``, so the total is monotone and bisection is exact to
+    tolerance. Caller guarantees ``total_lots`` is below the total cap capacity.
+    """
+    cap = FILL_CAP_MULTIPLE * v
+
+    def q_of(mu: float) -> np.ndarray:
+        bracket = np.maximum(0.0, (mu - base - SLIPPAGE_BASE * s) / (MARG_COEF * s))
+        return np.minimum(v * bracket * bracket, cap)
+
+    mu_lo = float(base.min())                     # Q(mu_lo) == 0
+    step = max(1.0, float(np.abs(base).max()) * 0.5 + float(s.max()))
+    mu_hi = mu_lo + step
+    for _ in range(200):
+        if q_of(mu_hi).sum() >= total_lots:
+            break
+        mu_hi += step
+        step *= 2.0
+    for _ in range(100):
+        mid = 0.5 * (mu_lo + mu_hi)
+        if q_of(mid).sum() < total_lots:
+            mu_lo = mid
+        else:
+            mu_hi = mid
+    return q_of(mu_hi)
+
+
+def omniscient(bins: pl.DataFrame, quantity: float, *,
+               side: str = "buy", **_: object) -> pl.Series:
+    """Lookahead lower-bound baseline: minimise realised cost with perfect foresight.
+
+    The *omniscient* schedule is allowed to see the **whole day** for this
+    (security, date) - the realised per-bin price (``vwap``), spread
+    (``twa_ask - twa_bid``) and liquidity (``volume``) - and chooses the per-bin
+    lots that **minimise the actual implementation shortfall** of the fill model.
+    Since the arrival benchmark ``arrival_price * quantity`` is fixed, that is the
+    same as minimising the transacted notional::
+
+        buy : minimise  sum_k q_k * (vwap_k + slip_k * s_k)   -> trade where price is LOW
+        sell: maximise  sum_k q_k * (vwap_k - slip_k * s_k)   -> trade where price is HIGH
+
+    with ``slip_k = SLIPPAGE_BASE + SLIPPAGE_COEF * sqrt(q_k / V_k)``. This is a
+    convex problem; the optimum equalises the (signed) marginal cost across all
+    traded bins, with each bin floored at 0 and **capped at the fill limit**
+    ``2 * V_k``. The common multiplier ``mu`` is found by bisection (see
+    :func:`_solve_omniscient_q`), then rounded to whole lots.
+
+    It captures everything a schedule could possibly exploit - spread, liquidity
+    **and** intraday price drift (e.g. front-load a buy when the price will rise) -
+    so it is the unbeatable reference the realistic strategies are measured against,
+    not a deployable strategy (it uses the future).
+
+    Because it respects the ``2 * V_k`` cap, it **fills 100%** whenever the order
+    fits the day's capacity (``quantity <= sum_k 2 * V_k`` over fillable bins). When
+    it does not - the order is larger than the whole day can absorb even maxing out
+    every bin - it requests the cap ``2 * V_k`` in every fillable bin (the most that
+    can fill) and the remainder is unavoidably left over.
+
+    Parameters
+    ----------
+    bins : pl.DataFrame
+        Bins for one (security, date) with ``volume``, ``vwap``, ``twa_ask`` and
+        ``twa_bid``. Aligned to the caller's (time-sorted) row order.
+    quantity : float
+        Total lots to execute (rounded to whole lots).
+    side : str, default ``"buy"``
+        ``"buy"`` or ``"sell"``; forwarded by :func:`run_strategy`. Sets whether
+        low-price bins (buy) or high-price bins (sell) are favoured.
+    **_ :
+        Ignored. Present so strategies share a uniform calling convention.
+
+    Returns
+    -------
+    pl.Series
+        Integer-valued float series of length ``len(bins)``. Sums to
+        ``round(quantity)`` when the order fits the day's capacity; otherwise sums
+        to the capacity (``2 * V_k`` per fillable bin). Bins that cannot fill
+        (no data / zero volume) get 0; if no bin can fill, falls back to the
+        integer-lot TWAP split.
+    """
+    n = bins.height
+    if n == 0:
+        return pl.Series("q_requested", [], dtype=pl.Float64)
+
+    total_lots = int(round(float(quantity)))
+    if total_lots <= 0:
+        return pl.Series("q_requested", [0.0] * n, dtype=pl.Float64)
+
+    sign = 1.0 if str(side).strip().lower() == "buy" else -1.0
+    vwap = bins.get_column(VWAP_COL).cast(pl.Float64).to_numpy()
+    ask = bins.get_column(ASK_COL).cast(pl.Float64).to_numpy()
+    bid = bins.get_column(BID_COL).cast(pl.Float64).to_numpy()
+    vol = (bins.get_column(VOLUME_COL).cast(pl.Float64)
+           .fill_null(0.0).fill_nan(0.0).to_numpy())
+    spread = ask - bid
+
+    # A bin can fill only with full market data and positive volume (fill model).
+    active = (np.isfinite(vwap) & np.isfinite(ask) & np.isfinite(bid) & (vol > 0))
+    if not active.any():
+        return twap_schedule(bins, total_lots)
+
+    v = vol[active]
+    capacity = float((FILL_CAP_MULTIPLE * v).sum())
+    q_full = np.zeros(n, dtype=float)
+
+    if total_lots >= capacity:
+        # Cannot fill 100% even maxing every bin -> request the cap everywhere.
+        q_full[active] = FILL_CAP_MULTIPLE * v
+    else:
+        s_eff = np.maximum(spread[active], 1e-9)   # guard against zero/neg spreads
+        base = sign * vwap[active]
+        q_cont = _solve_omniscient_q(total_lots, base, s_eff, v)
+        # q_cont respects the integer 2*V cap, so largest-remainder rounding stays
+        # within the cap (capped bins have zero fractional part).
+        q_full[active] = _largest_remainder_round(q_cont, total_lots)
+
+    return pl.Series("q_requested", q_full, dtype=pl.Float64)
 
 
 def _simulate_fills_df(df: pl.DataFrame, *, side_col: str = "side",
@@ -586,7 +1012,11 @@ def run_strategy(
         raise ValueError("`bins` is empty - no bins for this (security, date).")
 
     b = bins.sort(BIN_TIME_COL)
-    requested = strategy(b, quantity, **(strategy_params or {}))
+    # Forward `side` so side-aware strategies (e.g. omniscient) can use it; all
+    # other strategies absorb it via **_. An explicit side in strategy_params wins.
+    params = dict(strategy_params or {})
+    params.setdefault("side", side_norm)
+    requested = strategy(b, quantity, **params)
     req_series = requested if isinstance(requested, pl.Series) else pl.Series(requested)
     if req_series.len() != b.height:
         raise ValueError(

@@ -6,9 +6,12 @@ across a trading day, and reports how good that execution was (fill rate, cost,
 implementation shortfall).
 
 The goal is to have a common framework where different execution strategies can
-be plugged in and measured on the same orders and the same market data. Today
-there is one strategy — **TWAP** (the naive baseline). Smarter strategies will
-be added and compared against it later.
+be plugged in and measured on the same orders and the same market data. There are
+five strategies today: **TWAP** and a realised-volume **VWAP** baseline; two
+static (no-lookahead, deployable) strategies — a historical-volume VWAP
+(`vwap_static`) and a cost-minimising liquidity/spread allocator
+(`liq_spr_static`); and an **`omniscient`** lower-bound baseline that is allowed to
+see the future and trades at the theoretically minimum cost.
 
 The reusable logic lives in [`execution.py`](execution.py); the
 [`trade_execution.ipynb`](trade_execution.ipynb) notebook is the driver that
@@ -101,6 +104,9 @@ A strategy answers one question: **given a day's bins and a total quantity, how
 much should be requested in each bin?** Everything else (the fill model, the
 metrics) is shared, so swapping strategies is the only variable when comparing.
 
+All strategies round their per-bin requests to **whole lots** — you can't trade
+fractional contracts — while still summing exactly to the order quantity.
+
 ### TWAP (Time-Weighted Average Price) — the baseline
 
 Splits the order **evenly across every bin** in the day — each bin requests
@@ -138,9 +144,53 @@ Because the schedule is built from the `volume` of the bins for one
 curve**, and the same instrument gets a different schedule on different days.
 
 This is a *realised*-volume VWAP — it uses the actual volume of the day being
-executed (perfect hindsight of the profile). A forecast-based VWAP, using the
-historical average profile per instrument (the per-`qcode` profile computed in
-[`test_snowflake.ipynb`](test_snowflake.ipynb)), would be the natural next step.
+executed (**perfect hindsight** of the profile), so it is a reference point, not a
+deployable strategy. The deployable version is **`vwap_static`** below, which
+weights by the *historical-average* volume curve instead.
+
+### VWAP (static) — historical-volume, deployable
+
+The same volume-proportional split as VWAP, but weighted by the
+**historical-average** volume per `(security, bin)` — the mean volume of each
+5-minute bin across all days in the data — instead of the day being executed. That
+removes the perfect-hindsight assumption, so `vwap_static` is the deployable VWAP
+baseline (`vwap_schedule` stays only as the hindsight reference). The static
+per-instrument curves are precomputed once by `build_liq_spread_curves`.
+
+### liq_spr_static — cost-minimising liquidity/spread allocation
+
+Chooses the per-bin quantities that **minimise the fill model's total slippage
+cost**, using static historical **spread** and **liquidity** curves per
+`(security, bin)` (the same curves as `vwap_static`). The spread curve is the
+average `twa_ask − twa_bid` for each bin across all days; the liquidity curve is the
+average volume.
+
+Because the slippage cost is convex in the quantity sent to a bin, the optimum sets
+the **marginal cost equal across all bins** — a single Lagrange multiplier `μ`,
+solved by bisection so the per-bin quantities sum to the order. Intuitively it pours
+quantity into tight-spread, liquid bins and starves wide-spread, thin ones; when
+every bin has the same spread it reduces *exactly* to volume-weighting (VWAP). It
+uses no information from the day being traded, so it is fully deployable. The
+derivation is in [`execution.py`](execution.py).
+
+### omniscient — the lookahead lower bound
+
+A **baseline, not a deployable strategy**: it is allowed to see the *whole day*
+for the (security, date) — the realised per-bin price, spread and liquidity — and
+chooses the per-bin lots that **minimise the actual implementation shortfall**. For
+a buy that means trading where the price turns out to be **lowest** (and the spread
+tightest); for a sell, where it is **highest**. It captures everything a schedule
+could exploit — spread, liquidity *and* intraday price drift — so it is the
+unbeatable reference the realistic strategies are measured against.
+
+It is the same convex cost minimisation as `liq_spr_static`, plus a (side-signed)
+price term and the `2 × volume` fill cap as an upper bound on each bin. Respecting
+that cap means it **fills 100%** whenever the order fits the day's capacity
+(`quantity ≤ Σ 2 × volume` over fillable bins); only when the order is larger than
+the entire day can absorb — even maxing out every bin — does it leave a remainder
+unfilled. In a quick demo run its implementation shortfall is far below every other
+strategy (it times the price perfectly), which is exactly what a lower bound should
+look like.
 
 > More strategies will be documented here as they are added.
 
