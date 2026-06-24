@@ -74,10 +74,14 @@ __all__ = [
     "build_liq_spread_curves",
     "vwap_static",
     "liq_spr_static",
+    "omniscient_vwap",
+    "omniscient_liq_spr",
     "omniscient",
     "run_strategy",
     "run_trade_list",
     "summarise_fills",
+    "decompose_is",
+    "decompose_is_stats",
     "SLIPPAGE_BASE",
     "SLIPPAGE_COEF",
     "FILL_CAP_MULTIPLE",
@@ -768,36 +772,178 @@ def _solve_omniscient_q(total_lots: int, base: np.ndarray, s: np.ndarray,
     return q_of(mu_hi)
 
 
+def _omniscient_day(bins: pl.DataFrame):
+    """Pull the realised per-bin arrays and the fillable mask for one day.
+
+    Returns ``(vwap, spread, vol, active)`` as numpy arrays, where ``active`` marks
+    bins that can actually fill (full market data and positive volume).
+    """
+    vwap = bins.get_column(VWAP_COL).cast(pl.Float64).to_numpy()
+    ask = bins.get_column(ASK_COL).cast(pl.Float64).to_numpy()
+    bid = bins.get_column(BID_COL).cast(pl.Float64).to_numpy()
+    vol = (bins.get_column(VOLUME_COL).cast(pl.Float64)
+           .fill_null(0.0).fill_nan(0.0).to_numpy())
+    active = (np.isfinite(vwap) & np.isfinite(ask) & np.isfinite(bid) & (vol > 0))
+    return vwap, ask - bid, vol, active
+
+
+def _omniscient_cost_schedule(bins: pl.DataFrame, total_lots: int, sign: float,
+                              with_drift: bool) -> pl.Series:
+    """Capped cost-minimising lookahead schedule (shared by the omniscient family).
+
+    Minimises ``sum_k [ base_k * q_k + slip_cost_k(q_k) ]`` over the day's realised
+    spread/liquidity, with ``0 <= q_k <= 2 * V_k`` and ``sum_k q_k = total_lots``,
+    where ``slip_cost_k`` is the fill model's spread cost. The linear term carries
+    the (signed) price/drift coefficient: ``base_k = sign * vwap_k`` when
+    ``with_drift`` (the full :func:`omniscient`), or ``0`` when not (the no-drift
+    :func:`omniscient_liq_spr`, which then ignores ``sign``). Respecting the cap
+    means it fills 100% whenever ``total_lots <= sum_k 2*V_k``; otherwise it maxes
+    out every fillable bin.
+    """
+    n = bins.height
+    vwap, spread, vol, active = _omniscient_day(bins)
+    if not active.any():
+        return twap_schedule(bins, total_lots)
+
+    v = vol[active]
+    capacity = float((FILL_CAP_MULTIPLE * v).sum())
+    q_full = np.zeros(n, dtype=float)
+    if total_lots >= capacity:
+        q_full[active] = FILL_CAP_MULTIPLE * v          # max fill; cannot do 100%
+    else:
+        s_eff = np.maximum(spread[active], 1e-9)        # guard zero/neg spreads
+        base = sign * vwap[active] if with_drift else np.zeros(int(active.sum()))
+        q_cont = _solve_omniscient_q(total_lots, base, s_eff, v)
+        q_full[active] = _largest_remainder_round(q_cont, total_lots)
+    return pl.Series("q_requested", q_full, dtype=pl.Float64)
+
+
+def omniscient_vwap(bins: pl.DataFrame, quantity: float, **_: object) -> pl.Series:
+    """Lookahead VWAP benchmark: track the **realised** volume profile (liquidity only).
+
+    The classic VWAP benchmark - the one execution is normally measured against.
+    With perfect foresight of the day's **volume** (but using *no* spread or price
+    information), it requests each fillable bin in proportion to that bin's realised
+    share of the day's volume::
+
+        q_requested[k] = quantity * V_k / sum(V_k)     (over fillable bins)
+
+    rounded to whole lots. Allocating only to fillable bins (data present, volume
+    > 0) and never above the ``2 * V_k`` cap, it **fills 100%** whenever the order
+    fits the day's capacity (``quantity <= sum_k 2*V_k``); otherwise it maxes out
+    every bin. Unlike :func:`vwap_static` (historical curve, deployable), this uses
+    the actual day's volume, so it is a benchmark, not a deployable strategy. It is
+    the liquidity-only member of the omniscient family - it deliberately does **not**
+    optimise spread or price drift (see :func:`omniscient_liq_spr` and
+    :func:`omniscient`).
+
+    Parameters
+    ----------
+    bins : pl.DataFrame
+        Bins for one (security, date) with ``volume``, ``vwap``, ``twa_ask``,
+        ``twa_bid``. Aligned to the caller's (time-sorted) row order.
+    quantity : float
+        Total lots to execute (rounded to whole lots).
+    **_ :
+        Ignored. Present so strategies share a uniform calling convention.
+
+    Returns
+    -------
+    pl.Series
+        Integer-valued float series of length ``len(bins)``. Sums to
+        ``round(quantity)`` when the order fits the day's capacity; otherwise sums
+        to capacity. Falls back to the integer-lot TWAP split if nothing can fill.
+    """
+    n = bins.height
+    if n == 0:
+        return pl.Series("q_requested", [], dtype=pl.Float64)
+    total_lots = int(round(float(quantity)))
+    if total_lots <= 0:
+        return pl.Series("q_requested", [0.0] * n, dtype=pl.Float64)
+
+    _vwap, _spread, vol, active = _omniscient_day(bins)
+    if not active.any():
+        return twap_schedule(bins, total_lots)
+
+    v = vol[active]
+    capacity = float((FILL_CAP_MULTIPLE * v).sum())
+    q_full = np.zeros(n, dtype=float)
+    if total_lots >= capacity:
+        q_full[active] = FILL_CAP_MULTIPLE * v
+    else:
+        # proportional to realised volume; cumulative rounding keeps the sum exact
+        cum_goal = np.round(np.cumsum(total_lots * v / v.sum()))
+        per_bin = np.diff(np.concatenate(([0.0], cum_goal)))
+        q_full[active] = per_bin
+    return pl.Series("q_requested", q_full, dtype=pl.Float64)
+
+
+def omniscient_liq_spr(bins: pl.DataFrame, quantity: float, **_: object) -> pl.Series:
+    """Lookahead liquidity+spread benchmark: minimise slippage cost, **no drift**.
+
+    The middle member of the omniscient family. With perfect foresight of the day's
+    realised **spread and liquidity** (but **not** using the price/drift signal), it
+    chooses the per-bin lots that minimise the fill model's spread cost
+    ``sum_k [ SLIPPAGE_BASE*s_k*q_k + SLIPPAGE_COEF*s_k*q_k**1.5 / sqrt(V_k) ]``
+    subject to ``0 <= q_k <= 2*V_k`` and the bins summing to the order. It is the
+    same cost minimisation as :func:`liq_spr_static`, but on the *actual* day's
+    spread/liquidity (lookahead) and respecting the fill cap, so it fills 100%
+    whenever the order fits capacity.
+
+    Because the spread cost is the same whether buying or selling, this is
+    side-independent. It isolates the part of the omniscient edge that comes from
+    spread/liquidity timing - which is far more predictable than the drift term that
+    :func:`omniscient` additionally exploits.
+
+    Parameters
+    ----------
+    bins : pl.DataFrame
+        Bins for one (security, date) with ``volume``, ``vwap``, ``twa_ask``,
+        ``twa_bid``. Aligned to the caller's (time-sorted) row order.
+    quantity : float
+        Total lots to execute (rounded to whole lots).
+    **_ :
+        Ignored. Present so strategies share a uniform calling convention.
+
+    Returns
+    -------
+    pl.Series
+        Integer-valued float series of length ``len(bins)`` (see
+        :func:`_omniscient_cost_schedule`).
+    """
+    n = bins.height
+    if n == 0:
+        return pl.Series("q_requested", [], dtype=pl.Float64)
+    total_lots = int(round(float(quantity)))
+    if total_lots <= 0:
+        return pl.Series("q_requested", [0.0] * n, dtype=pl.Float64)
+    return _omniscient_cost_schedule(bins, total_lots, sign=1.0, with_drift=False)
+
+
 def omniscient(bins: pl.DataFrame, quantity: float, *,
                side: str = "buy", **_: object) -> pl.Series:
-    """Lookahead lower-bound baseline: minimise realised cost with perfect foresight.
+    """Full lookahead lower bound: minimise realised cost using spread, liquidity AND drift.
 
-    The *omniscient* schedule is allowed to see the **whole day** for this
-    (security, date) - the realised per-bin price (``vwap``), spread
-    (``twa_ask - twa_bid``) and liquidity (``volume``) - and chooses the per-bin
-    lots that **minimise the actual implementation shortfall** of the fill model.
-    Since the arrival benchmark ``arrival_price * quantity`` is fixed, that is the
-    same as minimising the transacted notional::
+    The strongest member of the omniscient family: it sees the **whole day** for this
+    (security, date) - realised per-bin price (``vwap``), spread (``twa_ask -
+    twa_bid``) and liquidity (``volume``) - and chooses the per-bin lots that
+    **minimise the actual implementation shortfall**. Since the arrival benchmark
+    ``arrival_price * quantity`` is fixed, that is the same as minimising the
+    transacted notional::
 
         buy : minimise  sum_k q_k * (vwap_k + slip_k * s_k)   -> trade where price is LOW
         sell: maximise  sum_k q_k * (vwap_k - slip_k * s_k)   -> trade where price is HIGH
 
-    with ``slip_k = SLIPPAGE_BASE + SLIPPAGE_COEF * sqrt(q_k / V_k)``. This is a
-    convex problem; the optimum equalises the (signed) marginal cost across all
-    traded bins, with each bin floored at 0 and **capped at the fill limit**
-    ``2 * V_k``. The common multiplier ``mu`` is found by bisection (see
-    :func:`_solve_omniscient_q`), then rounded to whole lots.
+    with ``slip_k = SLIPPAGE_BASE + SLIPPAGE_COEF * sqrt(q_k / V_k)``. Convex, so the
+    optimum equalises the signed marginal cost across traded bins, each floored at 0
+    and **capped at** ``2 * V_k`` (so it fills 100% when the order fits capacity,
+    else maxes every bin). See :func:`_omniscient_cost_schedule` / ``_solve_omniscient_q``.
 
-    It captures everything a schedule could possibly exploit - spread, liquidity
-    **and** intraday price drift (e.g. front-load a buy when the price will rise) -
-    so it is the unbeatable reference the realistic strategies are measured against,
-    not a deployable strategy (it uses the future).
-
-    Because it respects the ``2 * V_k`` cap, it **fills 100%** whenever the order
-    fits the day's capacity (``quantity <= sum_k 2 * V_k`` over fillable bins). When
-    it does not - the order is larger than the whole day can absorb even maxing out
-    every bin - it requests the cap ``2 * V_k`` in every fillable bin (the most that
-    can fill) and the remainder is unavoidably left over.
+    It exploits everything a schedule could - spread, liquidity **and** intraday
+    price drift - so it is the unbeatable reference, not a deployable strategy. The
+    drift edge in particular is not realistically predictable; the no-drift
+    :func:`omniscient_liq_spr` and the liquidity-only :func:`omniscient_vwap` are the
+    achievable benchmarks.
 
     Parameters
     ----------
@@ -815,49 +961,17 @@ def omniscient(bins: pl.DataFrame, quantity: float, *,
     Returns
     -------
     pl.Series
-        Integer-valued float series of length ``len(bins)``. Sums to
-        ``round(quantity)`` when the order fits the day's capacity; otherwise sums
-        to the capacity (``2 * V_k`` per fillable bin). Bins that cannot fill
-        (no data / zero volume) get 0; if no bin can fill, falls back to the
-        integer-lot TWAP split.
+        Integer-valued float series of length ``len(bins)`` (see
+        :func:`_omniscient_cost_schedule`).
     """
     n = bins.height
     if n == 0:
         return pl.Series("q_requested", [], dtype=pl.Float64)
-
     total_lots = int(round(float(quantity)))
     if total_lots <= 0:
         return pl.Series("q_requested", [0.0] * n, dtype=pl.Float64)
-
     sign = 1.0 if str(side).strip().lower() == "buy" else -1.0
-    vwap = bins.get_column(VWAP_COL).cast(pl.Float64).to_numpy()
-    ask = bins.get_column(ASK_COL).cast(pl.Float64).to_numpy()
-    bid = bins.get_column(BID_COL).cast(pl.Float64).to_numpy()
-    vol = (bins.get_column(VOLUME_COL).cast(pl.Float64)
-           .fill_null(0.0).fill_nan(0.0).to_numpy())
-    spread = ask - bid
-
-    # A bin can fill only with full market data and positive volume (fill model).
-    active = (np.isfinite(vwap) & np.isfinite(ask) & np.isfinite(bid) & (vol > 0))
-    if not active.any():
-        return twap_schedule(bins, total_lots)
-
-    v = vol[active]
-    capacity = float((FILL_CAP_MULTIPLE * v).sum())
-    q_full = np.zeros(n, dtype=float)
-
-    if total_lots >= capacity:
-        # Cannot fill 100% even maxing every bin -> request the cap everywhere.
-        q_full[active] = FILL_CAP_MULTIPLE * v
-    else:
-        s_eff = np.maximum(spread[active], 1e-9)   # guard against zero/neg spreads
-        base = sign * vwap[active]
-        q_cont = _solve_omniscient_q(total_lots, base, s_eff, v)
-        # q_cont respects the integer 2*V cap, so largest-remainder rounding stays
-        # within the cap (capped bins have zero fractional part).
-        q_full[active] = _largest_remainder_round(q_cont, total_lots)
-
-    return pl.Series("q_requested", q_full, dtype=pl.Float64)
+    return _omniscient_cost_schedule(bins, total_lots, sign=sign, with_drift=True)
 
 
 def _simulate_fills_df(df: pl.DataFrame, *, side_col: str = "side",
@@ -1198,6 +1312,13 @@ def summarise_fills(
                 is_bps      = is_currency / (arrival_price * order_quantity) * 1e4
 
             Positive = underperformance vs an immediate arrival-price fill.
+        ``is_slippage_bps`` / ``is_drift_bps`` / ``is_opportunity_bps``
+            Additive decomposition of ``is_bps`` (the three sum to it exactly):
+            **slippage** = spread cost paid on the filled lots (>= 0); **drift** =
+            realised price move from the arrival price to the bin VWAPs actually
+            filled at (timing of the filled portion); **opportunity** = the
+            unfilled remainder marked at ``terminal_price`` vs arrival (0 when the
+            order fills 100%). See :func:`decompose_is` to aggregate them.
 
     Notes
     -----
@@ -1228,6 +1349,9 @@ def summarise_fills(
         total_requested=pl.col("q_requested").sum(),
         total_filled=pl.col("q_filled").sum(),
         filled_notional=pl.col("notional").sum(),
+        # notional of the filled lots at the *bin VWAP* (i.e. before spread cost) -
+        # used to split IS into a price-drift term vs the spread-cost term.
+        filled_vwap_notional=(pl.col("q_filled") * pl.col(VWAP_COL)).sum(),
         total_cost=pl.col("cost").sum(),
         arrival_price=pl.col(arrival_col).filter(pl.col(arrival_col).is_not_null()).first(),
         terminal_price=pl.col(VWAP_COL).filter(pl.col(VWAP_COL).is_not_null()).last(),
@@ -1253,10 +1377,99 @@ def summarise_fills(
          / pl.col("arrival_price") * 1e4).alias("exec_slippage_bps"),
         (sign * (realised - paper)).alias("is_currency"),
     )
+    # --- IS decomposition (the three pieces sum to is_currency / is_bps) ---
+    #   slippage   = spread cost paid on the filled lots             (>= 0)
+    #   drift      = price move arrival -> filled bin VWAPs (timing on the filled part)
+    #   opportunity= unfilled remainder marked at terminal vs arrival (0 if 100% filled)
+    slippage_cur = pl.col("total_cost")
+    drift_cur = sign * (pl.col("filled_vwap_notional")
+                        - pl.col("arrival_price") * pl.col("total_filled"))
+    opp_cur = sign * pl.col("unfilled_qty") * (pl.col("terminal_price")
+                                               - pl.col("arrival_price"))
     g = g.with_columns(
-        pl.when(paper != 0)
-        .then(pl.col("is_currency") / paper * 1e4)
-        .otherwise(None)
-        .alias("is_bps"),
+        pl.when(paper != 0).then(pl.col("is_currency") / paper * 1e4)
+        .otherwise(None).alias("is_bps"),
+        pl.when(paper != 0).then(slippage_cur / paper * 1e4)
+        .otherwise(None).alias("is_slippage_bps"),
+        pl.when(paper != 0).then(drift_cur / paper * 1e4)
+        .otherwise(None).alias("is_drift_bps"),
+        pl.when(paper != 0).then(opp_cur / paper * 1e4)
+        .otherwise(None).alias("is_opportunity_bps"),
     )
     return g
+
+
+def decompose_is(summary: pl.DataFrame, by: Optional[str] = None) -> pl.DataFrame:
+    """Aggregate the implementation-shortfall decomposition across orders.
+
+    Averages the per-order IS components from :func:`summarise_fills` so you can
+    see, in basis points, where the shortfall comes from:
+
+    * ``is_slippage_bps``    - spread cost paid on the filled lots (always >= 0);
+    * ``is_drift_bps``       - realised price drift between the arrival price and
+      the bin VWAPs you actually filled at (the *timing* of the filled portion);
+    * ``is_opportunity_bps`` - cost of the unfilled remainder, marked at the
+      terminal price vs arrival (zero when the order fills 100%).
+
+    The three sum to ``is_bps`` for every order, and because the mean is linear
+    they also sum to the mean ``is_bps`` shown here. Orders with an undefined
+    ``is_bps`` (e.g. a non-trading day with no arrival price) are dropped.
+
+    Parameters
+    ----------
+    summary : pl.DataFrame
+        Output of :func:`summarise_fills`.
+    by : str, optional
+        Column to group by (e.g. ``"qcode"`` or ``"trade_list"``). ``None``
+        returns a single overall row.
+
+    Returns
+    -------
+    pl.DataFrame
+        ``n_orders``, ``fill_rate`` and the mean of each component plus
+        ``is_bps`` (one row, or one row per group).
+    """
+    comps = ["is_slippage_bps", "is_drift_bps", "is_opportunity_bps", "is_bps"]
+    s = summary.filter(pl.col("is_bps").is_not_null() & pl.col("is_bps").is_not_nan())
+    aggs = ([pl.len().alias("n_orders"), pl.col("fill_rate").mean().alias("fill_rate")]
+            + [pl.col(c).mean().alias(c) for c in comps])
+    if by is None:
+        return s.select(aggs)
+    return s.group_by(by, maintain_order=True).agg(aggs).sort(by)
+
+
+def decompose_is_stats(summary: pl.DataFrame,
+                       label: Optional[str] = None) -> pl.DataFrame:
+    """Per-component distribution stats of the IS decomposition (one strategy).
+
+    Returns one row per IS component - ``slippage``, ``drift``, ``opportunity``
+    and the ``total`` (``is_bps``) - with the **mean**, **median** and (sample,
+    ddof=1) **variance** in bps across orders. Orders with an undefined ``is_bps``
+    are dropped. Pass ``label`` (e.g. the strategy name) to tag every row, so the
+    results for several strategies can be ``pl.concat``-ed into one table.
+
+    Parameters
+    ----------
+    summary : pl.DataFrame
+        Output of :func:`summarise_fills` (must carry the ``is_*_bps`` columns).
+    label : str, optional
+        Strategy name stamped into a leading ``strategy`` column when given.
+
+    Returns
+    -------
+    pl.DataFrame
+        Columns ``[strategy?, component, mean, median, variance]`` - four rows
+        (slippage, drift, opportunity, total).
+    """
+    comps = [("slippage", "is_slippage_bps"), ("drift", "is_drift_bps"),
+             ("opportunity", "is_opportunity_bps"), ("total", "is_bps")]
+    s = summary.filter(pl.col("is_bps").is_not_null() & pl.col("is_bps").is_not_nan())
+    recs = []
+    for name, col in comps:
+        c = s.get_column(col)
+        rec = {"component": name, "mean": c.mean(),
+               "median": c.median(), "variance": c.var()}
+        if label is not None:
+            rec = {"strategy": label, **rec}
+        recs.append(rec)
+    return pl.DataFrame(recs)

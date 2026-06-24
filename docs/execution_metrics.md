@@ -107,3 +107,33 @@ underperformance** vs filling the whole order instantly at the arrival price.
 **Quick read of an order:** `fill_rate` tells you *how much* got done, `is_bps`
 tells you *how expensively* (all-in), and `total_cost` vs `exec_slippage_bps`
 tells you how much of the damage was spread vs market movement.
+
+---
+
+## Decomposing `is_bps` (where the shortfall comes from)
+
+`summarise_fills` also splits `is_bps` into three **additive** components — they
+sum to `is_bps` exactly, for every order:
+
+| Column | Currency formula (÷ `paper` × 1e4 for bps) | Meaning |
+|---|---|---|
+| `is_slippage_bps` | `total_cost` | Spread cost paid on the filled lots. Always ≥ 0. |
+| `is_drift_bps` | `sign × (Σ q_filled×vwap − arrival_price × total_filled)` | **Realised price drift** from the arrival price to the bin VWAPs you actually filled at — the *timing* of the filled portion. Signed; negative if the market moved in your favour. |
+| `is_opportunity_bps` | `sign × unfilled_qty × (terminal_price − arrival_price)` | **Opportunity cost** of the unfilled remainder, marked at the terminal price vs arrival. Exactly `0` when `fill_rate = 1`. |
+
+```
+is_slippage_bps + is_drift_bps + is_opportunity_bps  ==  is_bps
+```
+
+Relationship to the other columns: `exec_slippage_bps` ≈ slippage + drift, but it
+is measured *per filled unit* (÷ filled notional), whereas these components are
+÷ the whole order's `paper` notional so they add up to `is_bps`. The opportunity
+term is exactly the part `exec_slippage_bps` ignores (it looks only at the filled
+portion).
+
+**Aggregating — `decompose_is(summary, by=None)`:** averages the components across
+orders (optionally grouped by `qcode`, `trade_list`, …) alongside `n_orders` and
+`fill_rate`. Because the mean is linear, the component means still sum to the mean
+`is_bps`, so you can read off "of the −11 bps mean, X bps was slippage, Y drift,
+Z opportunity." Orders with an undefined `is_bps` (e.g. a non-trading day with no
+arrival price) are dropped.

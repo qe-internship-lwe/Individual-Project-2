@@ -6,12 +6,13 @@ across a trading day, and reports how good that execution was (fill rate, cost,
 implementation shortfall).
 
 The goal is to have a common framework where different execution strategies can
-be plugged in and measured on the same orders and the same market data. There are
-five strategies today: **TWAP** and a realised-volume **VWAP** baseline; two
-static (no-lookahead, deployable) strategies — a historical-volume VWAP
-(`vwap_static`) and a cost-minimising liquidity/spread allocator
-(`liq_spr_static`); and an **`omniscient`** lower-bound baseline that is allowed to
-see the future and trades at the theoretically minimum cost.
+be plugged in and measured on the same orders and the same market data. The
+strategies fall into two groups: **deployable** ones that use no future
+information — **TWAP**, a historical-volume VWAP (`vwap_static`) and a
+cost-minimising liquidity/spread allocator (`liq_spr_static`) — and a family of
+**`omniscient`** lookahead *benchmarks* that are allowed to see the realised day
+and mark the bar the deployable strategies are chasing. (A realised-volume
+`vwap_schedule` also exists as a hindsight reference.)
 
 The reusable logic lives in [`execution.py`](execution.py); the
 [`trade_execution.ipynb`](trade_execution.ipynb) notebook is the driver that
@@ -215,7 +216,15 @@ Each order collapses to a single row of execution metrics. At a glance:
   top-line number when comparing strategies.
 
 The benchmark (the "arrival price" these are measured against) is the **open of
-the first bin** — the decision price before any trading happens.
+the first bin** — the decision price before any trading happens. The unfilled
+remainder's opportunity cost is marked at the **terminal price** — the last bin's
+VWAP.
+
+`is_bps` also comes pre-split into three additive pieces — `is_slippage_bps`
+(spread cost), `is_drift_bps` (realised price drift on the filled part), and
+`is_opportunity_bps` (the unfilled remainder vs arrival) — which sum to `is_bps`.
+`decompose_is(summary)` averages them across orders so you can see where the
+shortfall actually came from.
 
 > **Full column-by-column reference:** see
 > [`docs/execution_metrics.md`](docs/execution_metrics.md). It documents every
