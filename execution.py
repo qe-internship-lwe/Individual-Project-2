@@ -72,11 +72,15 @@ __all__ = [
     "twap_schedule",
     "vwap_schedule",
     "build_liq_spread_curves",
+    "build_rolling_curves",
     "vwap_static",
     "liq_spr_static",
+    "vwap_adaptive",
     "omniscient_vwap",
     "omniscient_liq_spr",
     "omniscient",
+    "liq_spread_bayesdrift",
+    "vwap_adaptive_v2",
     "run_strategy",
     "run_trade_list",
     "summarise_fills",
@@ -555,6 +559,135 @@ def build_liq_spread_curves(bins: pl.DataFrame) -> dict:
     return curves
 
 
+def build_rolling_curves(
+    history: pl.DataFrame,
+    needed: pl.DataFrame,
+    *,
+    window_days: int = 22,
+) -> dict:
+    """Per-order spread/liquidity curves from the **trailing** ``window_days``.
+
+    Lookahead-free replacement for :func:`build_liq_spread_curves`. For every
+    ``(qcode, date)`` order key in ``needed`` this estimates the per-bin spread
+    ``s_k`` and liquidity ``V_k`` from **only the qcode's previous
+    ``window_days`` trading days, strictly before that date** - a sliding window
+    that uses no information from the execution day or any future day. (The
+    static builder averages over *all* days, including days after the order, so
+    its "no same-day lookahead" claim still leaks the future profile.)
+
+    The profile is built at the **qcode** level (all that qcode's contract
+    months pooled per day), because the intraday shape is a qcode/exchange
+    property and a single contract month rarely has 22 prior days of its own.
+    Per ``(qcode, date_of_day, bin_start_time)`` the daily inputs are the
+    **summed** volume across that qcode's securities and the **volume-weighted**
+    mean spread; the trailing window then takes, per bin:
+
+    * ``V_k`` = mean daily volume over the window (absent days count as 0
+      volume, so a bin that seldom trades gets a correspondingly low weight);
+    * ``s_k`` = mean spread over the window days on which the bin actually
+      quoted (missing days skipped).
+
+    Fewer than ``window_days`` available -> uses whatever prior days exist. On
+    the **first** day a qcode is traded there is no prior data, so that key is
+    simply omitted from the result; :func:`vwap_static` / :func:`liq_spr_static`
+    then find no curve and fall back to the even-split :func:`twap_schedule`.
+
+    Parameters
+    ----------
+    history : pl.DataFrame
+        Full bin history to estimate from (e.g. the whole ``BINNED_DATA``), with
+        ``qcode``, ``publication_date``, ``bin_start_time``, ``volume``,
+        ``twa_ask``, ``twa_bid``.
+    needed : pl.DataFrame
+        The order keys to emit curves for; must have a ``qcode`` column and a
+        date column named either ``date`` (the ``TRADE_LIST`` convention) or
+        ``publication_date``. Only these ``(qcode, date)`` pairs are returned,
+        which keeps the result small even though the window is computed over the
+        whole history.
+    window_days : int, default 22
+        Length of the trailing trading-day window (per qcode).
+
+    Returns
+    -------
+    dict
+        ``{(qcode, date): {bin_start_time: (s_k, V_k)}}`` for the keys in
+        ``needed`` that have at least one prior trading day. Pass as
+        ``strategy_params={"curves": curves}`` to :func:`vwap_static` /
+        :func:`liq_spr_static`, exactly like :func:`build_liq_spread_curves`;
+        those strategies look up the rolling ``(qcode, date)`` key automatically.
+    """
+    date_col = "date" if "date" in needed.columns else DATE_COL
+    want: dict = {}
+    for qc, dt in needed.select(QCODE_COL, date_col).unique().iter_rows():
+        want.setdefault(qc, set()).add(dt)
+
+    h = history.select(QCODE_COL, DATE_COL, BIN_TIME_COL, VOLUME_COL, ASK_COL, BID_COL)
+    h = h.filter(pl.col(QCODE_COL).is_in(list(want.keys())))
+    h = h.with_columns(
+        pl.col(VOLUME_COL).cast(pl.Float64).fill_null(0.0).alias("_v"),
+        (pl.col(ASK_COL) - pl.col(BID_COL)).alias("_spr"),
+    )
+    # Daily per-(qcode, date, bin): summed volume + volume-weighted mean spread.
+    daily = h.group_by(QCODE_COL, DATE_COL, BIN_TIME_COL).agg(
+        pl.col("_v").sum().alias("vol"),
+        pl.when(pl.col("_v").sum() > 0)
+        .then((pl.col("_spr") * pl.col("_v")).sum() / pl.col("_v").sum())
+        .otherwise(pl.col("_spr").mean())
+        .alias("spr"),
+    )
+
+    curves: dict = {}
+    for qc, want_dates in want.items():
+        d = daily.filter(pl.col(QCODE_COL) == qc)
+        if d.height == 0:
+            continue
+        # Dense (date x bin) grid so absent bins count as zero-volume days and
+        # the trailing window is measured in the qcode's own trading days.
+        dates = d.select(DATE_COL).unique()
+        binsa = d.select(BIN_TIME_COL).unique()
+        grid = dates.join(binsa, how="cross").join(
+            d, on=[DATE_COL, BIN_TIME_COL], how="left"
+        )
+        grid = grid.with_columns(
+            pl.col("vol").fill_null(0.0),
+            pl.col("spr").is_not_null().cast(pl.Float64).alias("_pres"),
+            pl.col("spr").fill_null(0.0).alias("_spr0"),
+        ).sort(BIN_TIME_COL, DATE_COL)
+        # Trailing window of `window_days`, then shift(1) to exclude the day itself.
+        grid = grid.with_columns(
+            pl.col("vol").rolling_mean(window_days, min_samples=1).over(BIN_TIME_COL).alias("_vinc"),
+            pl.col("_spr0").rolling_sum(window_days, min_samples=1).over(BIN_TIME_COL).alias("_ssum"),
+            pl.col("_pres").rolling_sum(window_days, min_samples=1).over(BIN_TIME_COL).alias("_psum"),
+        ).with_columns(
+            pl.col("_vinc").shift(1).over(BIN_TIME_COL).alias("V_k"),
+            (pl.col("_ssum") / pl.col("_psum")).shift(1).over(BIN_TIME_COL).alias("s_k"),
+        )
+        # Emit only the needed dates that have prior history (V_k not null).
+        out = grid.filter(
+            pl.col(DATE_COL).is_in(list(want_dates)) & pl.col("V_k").is_not_null()
+        ).select(DATE_COL, BIN_TIME_COL, "s_k", "V_k")
+        for dt, bt, s_k, v_k in out.iter_rows():
+            curves.setdefault((qc, dt), {})[bt] = (s_k, v_k)
+    return curves
+
+
+def _per_bin_curve(bins: pl.DataFrame, curves: dict) -> dict:
+    """Look up the per-bin ``{bin_start_time: (s_k, V_k)}`` curve for these bins.
+
+    Supports both curve flavours transparently: the trailing
+    :func:`build_rolling_curves` keyed by ``(qcode, date)`` (preferred - no
+    lookahead) and the static :func:`build_liq_spread_curves` keyed by
+    ``security``. Returns ``{}`` when no curve exists (e.g. a qcode's first day),
+    which makes the caller fall back to :func:`twap_schedule`.
+    """
+    if QCODE_COL in bins.columns and DATE_COL in bins.columns:
+        key = (bins.get_column(QCODE_COL)[0], bins.get_column(DATE_COL)[0])
+        hit = curves.get(key)
+        if hit is not None:
+            return hit
+    return curves.get(bins.get_column(SECURITY_COL)[0], {})
+
+
 def vwap_static(bins: pl.DataFrame, quantity: float, *,
                 curves: dict, **_: object) -> pl.Series:
     """VWAP weighted by the **static historical** volume curve (no lookahead).
@@ -601,7 +734,7 @@ def vwap_static(bins: pl.DataFrame, quantity: float, *,
     if total_lots <= 0:
         return pl.Series("q_requested", [0.0] * n, dtype=pl.Float64)
 
-    per_bin = curves.get(bins.get_column(SECURITY_COL)[0], {})
+    per_bin = _per_bin_curve(bins, curves)
     times = bins.get_column(BIN_TIME_COL).to_list()
     vol = pl.Series(
         [per_bin.get(t, (None, 0.0))[1] or 0.0 for t in times], dtype=pl.Float64
@@ -717,8 +850,7 @@ def liq_spr_static(bins: pl.DataFrame, quantity: float, *,
     if total_lots <= 0:
         return pl.Series("q_requested", [0.0] * n, dtype=pl.Float64)
 
-    security = bins.get_column(SECURITY_COL)[0]
-    per_bin = curves.get(security, {})
+    per_bin = _per_bin_curve(bins, curves)
     times = bins.get_column(BIN_TIME_COL).to_list()
     s = np.array([per_bin.get(t, (np.nan, 0.0))[0] for t in times], dtype=float)
     v = np.array([per_bin.get(t, (np.nan, 0.0))[1] for t in times], dtype=float)
@@ -733,6 +865,144 @@ def liq_spr_static(bins: pl.DataFrame, quantity: float, *,
     q_full[active] = q_cont
     q_int = _largest_remainder_round(q_full, total_lots)
     return pl.Series("q_requested", q_int.astype(float), dtype=pl.Float64)
+
+
+def vwap_adaptive(bins: pl.DataFrame, quantity: float, *,
+                  curves: dict, rho: object = 0.5, recent: int = 3,
+                  clip_s: float = 1.5, **_: object) -> pl.Series:
+    """Adaptive (receding-horizon) VWAP that reacts to *realised* volume - **no lookahead**.
+
+    Starts from the trailing-window volume profile ``u_k`` (the ``V_k`` from
+    :func:`build_rolling_curves`, so the same lookahead-free anchor as
+    :func:`vwap_static`) and, as the day unfolds, tilts the schedule toward the
+    bins it now expects to be busier, using the short-horizon **volume
+    clustering** in the deseasonalised residual.
+
+    At the start of bin ``k`` (using only bins ``< k``):
+
+    1. **Surprise** over the last ``recent`` observed bins, deseasonalised by the
+       same trailing profile::
+
+           s_k = log( sum(realised_volume[k-recent : k]) / sum(u[k-recent : k]) )
+
+       (``s_0 = 0``; clipped to ``+/- clip_s`` for safety).
+    2. **Forecast** every remaining bin, surprise decaying by horizon, then
+       converted **back to the volume scale** through ``u`` (the round-trip)::
+
+           v_hat[f] = u[f] * exp(rho ** (f - k + 1) * s_k),   f >= k
+
+       Far bins (``rho**h -> 0``) revert to ``u[f]`` - i.e. the schedule's tail is
+       exactly the static profile, so this degrades gracefully to
+       :func:`vwap_static` when there is no signal (and *is* it at the open).
+    3. **Allocate** the still-unscheduled quantity in proportion to ``v_hat``,
+       request bin ``k``, advance.
+
+    This is implemented as the causal telescoping form
+    ``a_k = v_hat_k / sum_{f>=k} v_hat_f`` followed by **cumulative rounding** of
+    ``cum_k = X * (1 - prod_{j<=k}(1 - a_j))`` to whole lots - fully vectorised, no
+    Python loop, and every ``a_k`` (and the cumulative target through ``k``) depends
+    only on ``s_k`` (hence on ``volume[< k]``). Cumulative rounding is essential:
+    a global largest-remainder pass would assign leftover lots by whole-day
+    fractional rank, letting a later bin flip an earlier bin's lots. It uses **no
+    same-day future information**: bin ``k``'s request is invariant to any change
+    in ``volume[k:]`` (see the causality self-test in the notebook). The
+    ``2 * volume`` fill cap is *not* fed back here (no unfilled carryover) so the
+    schedule stays a pure function of past volume; carryover would make it
+    path-dependent on realised fills and is left as a separate option.
+
+    Parameters
+    ----------
+    bins : pl.DataFrame
+        Bins for one (security, date); needs ``security``, ``bin_start_time``,
+        ``volume`` and (for the rolling key) ``qcode`` + ``publication_date``.
+        Time-sorted by the caller.
+    quantity : float
+        Total lots to execute (rounded to whole lots).
+    curves : dict
+        ``{(qcode, date): {bin_start_time: (s_k, V_k)}}`` from
+        :func:`build_rolling_curves` (only ``V_k`` is used as ``u_k``). The
+        security-keyed :func:`build_liq_spread_curves` form also works via the
+        shared lookup, but then ``u`` is static rather than trailing.
+    rho : float or dict, default 0.5
+        AR(1) persistence of the deseasonalised residual. A float applies to all;
+        a dict is looked up by ``qcode`` (then ``(qcode, date)``), falling back to
+        0.5. ``rho`` is a fixed structural constant (not fitted to the executed
+        day), so it introduces no lookahead.
+    recent : int, default 3
+        Number of trailing bins pooled into the surprise ``s_k``.
+    clip_s : float, default 1.5
+        Symmetric clip on ``s_k`` (in log units) to bound the tilt.
+    **_ :
+        Ignored (uniform calling convention; absorbs ``side``).
+
+    Returns
+    -------
+    pl.Series
+        Integer-valued float series of length ``len(bins)`` summing to
+        ``round(quantity)``. Falls back to :func:`twap_schedule` when no trailing
+        profile exists (e.g. a qcode's first day).
+    """
+    n = bins.height
+    if n == 0:
+        return pl.Series("q_requested", [], dtype=pl.Float64)
+    total_lots = int(round(float(quantity)))
+    if total_lots <= 0:
+        return pl.Series("q_requested", [0.0] * n, dtype=pl.Float64)
+
+    per_bin = _per_bin_curve(bins, curves)
+    times = bins.get_column(BIN_TIME_COL).to_list()
+    u = np.array([per_bin.get(t, (np.nan, 0.0))[1] for t in times], dtype=float)
+    u = np.nan_to_num(u, nan=0.0)
+    u = np.clip(u, 0.0, None)
+    if u.sum() <= 0:
+        # No trailing profile (e.g. qcode's first day) -> even-split TWAP.
+        return twap_schedule(bins, total_lots)
+
+    # resolve rho (fixed structural constant; never the executed day's data)
+    if isinstance(rho, dict):
+        qc = bins.get_column(QCODE_COL)[0] if QCODE_COL in bins.columns else None
+        dt = bins.get_column(DATE_COL)[0] if DATE_COL in bins.columns else None
+        r = rho.get((qc, dt), rho.get(qc, 0.5))
+    else:
+        r = float(rho)
+    r = min(max(float(r), 0.0), 0.99)
+
+    # realised volume, used STRICTLY causally (bin k sees only volume[:k])
+    vr = bins.get_column(VOLUME_COL).cast(pl.Float64).fill_null(0.0).fill_nan(0.0).to_numpy()
+
+    eps = 1e-9
+    k_idx = np.arange(n)
+    lo = np.maximum(0, k_idx - int(recent))
+    cum_v = np.concatenate([[0.0], np.cumsum(vr)])     # cum_v[k] = sum(vr[:k])
+    cum_u = np.concatenate([[0.0], np.cumsum(u)])
+    rr = cum_v[k_idx] - cum_v[lo]                       # realised over last `recent` bins (< k)
+    ru = cum_u[k_idx] - cum_u[lo]                       # expected over the same bins
+    s = np.log((rr + eps) / (ru + eps))
+    s[0] = 0.0                                          # no history at the open
+    s = np.clip(s, -clip_s, clip_s)
+
+    # v_hat[k, f] = u[f] * exp(rho**(f-k+1) * s[k]) for f >= k  (lower triangle = 0)
+    D = k_idx[None, :] - k_idx[:, None]                 # D[k, f] = f - k
+    valid = D >= 0
+    # exponent >= 1 only on the valid (upper-triangle) entries; clamp elsewhere so
+    # r ** (neg) is never evaluated (avoids 0**neg warnings); masked out anyway.
+    decay = np.where(valid, r ** np.where(valid, D + 1, 0), 0.0)
+    vhat = u[None, :] * np.exp(decay * s[:, None]) * valid
+    denom = vhat.sum(axis=1)
+    a = np.where(denom > 0, np.diag(vhat) / np.where(denom > 0, denom, 1.0), 0.0)
+    a = np.clip(a, 0.0, 1.0)
+
+    # Causal CUMULATIVE rounding. The cumulative target through bin k,
+    #   cum_k = X * (1 - prod_{j<=k}(1 - a_j)),
+    # depends only on a_0..a_k (hence volume[:k]); differencing its rounded value
+    # gives whole lots whose bin-k entry is a function of past volume only.
+    # (A global largest-remainder round would assign the +/-1 leftovers by
+    # whole-day fractional rank, letting a LATER bin flip an earlier bin -> lookahead.)
+    cum = total_lots * (1.0 - np.cumprod(1.0 - a))
+    cum[-1] = float(total_lots)               # last bin absorbs the rounding remainder
+    cum_round = np.rint(cum)
+    req_int = np.diff(np.concatenate([[0.0], cum_round]))
+    return pl.Series("q_requested", req_int.astype(float), dtype=pl.Float64)
 
 
 def _solve_omniscient_q(total_lots: int, base: np.ndarray, s: np.ndarray,
@@ -972,6 +1242,251 @@ def omniscient(bins: pl.DataFrame, quantity: float, *,
         return pl.Series("q_requested", [0.0] * n, dtype=pl.Float64)
     sign = 1.0 if str(side).strip().lower() == "buy" else -1.0
     return _omniscient_cost_schedule(bins, total_lots, sign=sign, with_drift=True)
+
+
+def _solve_drift_q(total: float, base: np.ndarray, s: np.ndarray,
+                   v: np.ndarray) -> np.ndarray:
+    """Continuous drift-adjusted liq/spread allocation (no fill cap) summing to ``total``.
+
+    ``q_k(mu) = v_k * max(0, (mu - base_k)/(MARG_COEF*s_k) - THRESH_RATIO)**2``,
+    ``mu`` solved by bisection so the bins sum to ``total``. ``base_k`` is the
+    (signed) expected adverse drift ``D_k`` for bin k; ``base = 0`` recovers the
+    plain liq/spread allocation.
+    """
+    def q_of(mu):
+        bracket = np.maximum(0.0, (mu - base) / (MARG_COEF * s) - THRESH_RATIO)
+        return v * bracket * bracket
+
+    mu_lo = float((base + SLIPPAGE_BASE * s).min())        # Q(mu_lo) == 0
+    step = max(1.0, float(np.abs(base).max()) + float(s.max()))
+    mu_hi = mu_lo + step
+    for _ in range(300):
+        if q_of(mu_hi).sum() >= total:
+            break
+        mu_hi += step
+        step *= 2.0
+    for _ in range(80):
+        mid = 0.5 * (mu_lo + mu_hi)
+        if q_of(mid).sum() < total:
+            mu_lo = mid
+        else:
+            mu_hi = mid
+    return q_of(mu_hi)
+
+
+def liq_spread_bayesdrift(bins: pl.DataFrame, quantity: float, *,
+                          curves: dict, side: str = "buy",
+                          window_min_obs: int = 3, snr_min: float = 1.0,
+                          **_: object) -> pl.Series:
+    """Adaptive (MPC) liq/spread schedule with a Bayesian drift overlay.
+
+    Uses trailing spread/liquidity curves (:func:`build_rolling_curves`)
+    and **re-plans every bin** as the day unfolds. At bin ``t`` it observes the
+    realised price path so far (bin opens ``S(0..t)``), updates a Bayesian drift
+    posterior under a standard-normal prior (``abar=0, nu^2=1``)::
+
+        sigma2 = var(open increments observed so far)        (day-so-far vol)
+        alpha* = (S(t) - S(0)) / (sigma2 + t)                (t in bins)
+        D_k    = sign * alpha* * (k - t)                     (expected adverse drift to bin k)
+
+    **The drift is only applied when it is statistically confident** - the
+    signal-to-noise ratio ``SNR = |alpha*| / posterior_std`` (posterior std
+    ``= sigma / sqrt(sigma2 + t)``, i.e. ``SNR ~ |S(t)-S(0)| / (sigma*sqrt(t))``,
+    the z-score of the observed move vs noise) must be at least ``snr_min``.
+    Below that the schedule is left as the plain rolling liq/spread allocation
+    (``D_k = 0``), so it is not nudged by moves indistinguishable from noise.
+
+    Then it solves the drift-adjusted allocation
+    ``q_k* = V_k*max(0,(mu - D_k)/(0.4242*s_k) - 0.2357)^2`` over the **remaining**
+    bins for the **remaining** quantity, and commits only bin ``t``'s slice before
+    rolling forward. For a buy in an up-trend (alpha*>0) future bins look dearer,
+    so it front-loads; a down-trend back-loads. Only prices from bins ``<= t`` are
+    used (no lookahead). The continuous plan is largest-remainder rounded to whole
+    lots and sums to ``round(quantity)``.
+
+    Parameters
+    ----------
+    bins : pl.DataFrame
+        Bins for one (security, date) with ``qcode``, ``publication_date``,
+        ``bin_start_time`` and ``open``. Time-sorted by the caller.
+    quantity : float
+        Total lots (rounded to whole lots).
+    curves : dict
+        Trailing per-bin spread/liquidity curves from :func:`build_rolling_curves`
+        (the ``curves`` convention shared with :func:`vwap_static` /
+        :func:`liq_spr_static`), via ``strategy_params``.
+    side : str
+        ``"buy"`` / ``"sell"`` (forwarded by :func:`run_strategy`); sets the drift sign.
+    window_min_obs : int, default 3
+        Minimum open increments before the drift is activated (off => D_k=0, i.e.
+        plain rolling liq/spread) to avoid reacting to one or two prints.
+    snr_min : float, default 1.0
+        Minimum signal-to-noise ratio ``|alpha*| / posterior_std`` required to
+        tilt the schedule for drift. Below it the bin keeps the plain rolling
+        liq/spread allocation (``D_k = 0``). Set 0 to always apply the drift.
+
+    Returns
+    -------
+    pl.Series
+        Integer-valued float series of length ``len(bins)`` summing to
+        ``round(quantity)``. Falls back to the integer-lot TWAP split if no
+        rolling curve exists for this (qcode, date) or nothing is tradeable.
+    """
+    n = bins.height
+    if n == 0:
+        return pl.Series("q_requested", [], dtype=pl.Float64)
+    total_lots = int(round(float(quantity)))
+    if total_lots <= 0:
+        return pl.Series("q_requested", [0.0] * n, dtype=pl.Float64)
+
+    per = _per_bin_curve(bins, curves)
+    if not per:
+        return twap_schedule(bins, total_lots)
+
+    times = bins.get_column(BIN_TIME_COL).to_list()
+    opens = bins.get_column(OPEN_COL).cast(pl.Float64).to_numpy()
+    s = np.array([per.get(t, (np.nan, 0.0))[0] for t in times], dtype=float)
+    v = np.array([per.get(t, (np.nan, 0.0))[1] for t in times], dtype=float)
+    active = np.isfinite(s) & (s > 0) & np.isfinite(v) & (v > 0)
+    if not active.any():
+        return twap_schedule(bins, total_lots)
+    s_eff = np.maximum(s, 1e-9)
+    sign = 1.0 if str(side).strip().lower() == "buy" else -1.0
+    finite_opens = opens[np.isfinite(opens)]
+    S0 = finite_opens[0] if finite_opens.size else np.nan
+
+    sched = np.zeros(n, dtype=float)
+    remaining = float(total_lots)
+    for t in range(n):
+        if remaining <= 1e-9:
+            break
+        rem = np.arange(t, n)
+        am = active[rem]
+        if not am.any():
+            continue
+        # Bayesian drift posterior from opens observed up to bin t, gated on SNR
+        D = np.zeros(rem.size)
+        if t >= window_min_obs and np.isfinite(opens[t]) and np.isfinite(S0):
+            inc = np.diff(opens[:t + 1])
+            inc = inc[np.isfinite(inc)]
+            if inc.size >= window_min_obs:
+                sigma2 = float(np.var(inc))
+                alpha = (opens[t] - S0) / (sigma2 + t)        # abar=0, nu^2=1
+                post_std = np.sqrt(sigma2 / (sigma2 + t)) if sigma2 > 0 else 0.0
+                snr = abs(alpha) / post_std if post_std > 0 else np.inf
+                if snr >= snr_min:                            # only tilt when confident
+                    D = sign * alpha * (rem - t).astype(float)
+        ra = rem[am]
+        q_rem = _solve_drift_q(remaining, D[am], s_eff[ra], v[ra])
+        q_t = float(q_rem[0]) if active[t] else 0.0           # commit bin t only
+        q_t = min(q_t, remaining)
+        sched[t] = q_t
+        remaining -= q_t
+    if remaining > 1e-9:                                       # dump any residual on last active bin
+        la = np.where(active)[0]
+        if la.size:
+            sched[la[-1]] += remaining
+
+    q_int = _largest_remainder_round(sched, total_lots)
+    return pl.Series("q_requested", q_int.astype(float), dtype=pl.Float64)
+
+
+def vwap_adaptive_v2(bins: pl.DataFrame, quantity: float, *,
+                     curves: dict, ar_rho: float = 0.5,
+                     z_clip: float = 2.0, **_: object) -> pl.Series:
+    """Adaptive constant-participation VWAP (AR volume-surprise overlay). EXPERIMENTAL.
+
+    A simpler, loop-based alternative to :func:`vwap_adaptive`: it scales the next
+    slice by a one-step volume-surprise forecast, trades, then renormalises the
+    remainder (rather than re-deriving the whole causal schedule).
+
+    Base schedule is the rolling expected-volume profile ``V_k``
+    (:func:`build_rolling_curves`). Walking the day, at each bin ``t``
+    it forecasts that bin's **volume surprise** from the just-completed bin via the
+    persistence we measured (rho ~ 0.5)::
+
+        z_{t-1} = log(realised_volume_{t-1} / V_{t-1})       (last bin's surprise)
+        f_t     = exp(ar_rho * z_{t-1})                      (forecast surprise, clipped)
+
+    then trades ``q_t = (this bin's profile slice of the remaining qty) * f_t`` -
+    i.e. **participate more when more volume is expected** (constant participation
+    against forecast volume) - and **renormalises the remaining quantity over the
+    remaining bins** afterwards. It does NOT re-optimise the whole schedule; it
+    scales the next slice by the surprise, trades, then re-spreads the remainder.
+
+    Only completed bins (``< t``) are read, so there's no lookahead. Continuous
+    internally, largest-remainder rounded to whole lots summing to
+    ``round(quantity)``. This rides the *volume-clustering* signal (real,
+    universal) rather than price drift (not forecastable).
+
+    Parameters
+    ----------
+    bins : pl.DataFrame
+        Bins for one (security, date) with ``qcode``, ``publication_date``,
+        ``bin_start_time`` and ``volume``. Time-sorted by the caller.
+    quantity : float
+        Total lots (rounded to whole lots).
+    curves : dict
+        Trailing per-bin curves from :func:`build_rolling_curves` (only ``V_k`` is
+        used), via ``strategy_params`` - the same ``curves`` convention as the
+        other strategies.
+    ar_rho : float, default 0.5
+        AR(1) coefficient for the one-step volume-surprise forecast (our pooled
+        estimate was ~0.49). 0 disables the overlay (-> plain rolling VWAP).
+    z_clip : float, default 2.0
+        Clip the observed log-surprise to ``[-z_clip, z_clip]`` before forecasting,
+        so a single freak bin can't blow up the next slice.
+
+    Returns
+    -------
+    pl.Series
+        Integer-valued float series of length ``len(bins)`` summing to
+        ``round(quantity)``; falls back to the integer-lot TWAP split when no
+        rolling curve exists or nothing is tradeable.
+    """
+    n = bins.height
+    if n == 0:
+        return pl.Series("q_requested", [], dtype=pl.Float64)
+    total_lots = int(round(float(quantity)))
+    if total_lots <= 0:
+        return pl.Series("q_requested", [0.0] * n, dtype=pl.Float64)
+
+    per = _per_bin_curve(bins, curves)
+    if not per:
+        return twap_schedule(bins, total_lots)
+    times = bins.get_column(BIN_TIME_COL).to_list()
+    V = np.array([per.get(t, (np.nan, 0.0))[1] for t in times], dtype=float)
+    realised = (bins.get_column(VOLUME_COL).cast(pl.Float64)
+                .fill_null(0.0).fill_nan(0.0).to_numpy())
+    active = np.isfinite(V) & (V > 0)
+    if not active.any():
+        return twap_schedule(bins, total_lots)
+
+    sched = np.zeros(n, dtype=float)
+    remaining = float(total_lots)
+    for t in range(n):
+        if remaining <= 1e-9:
+            break
+        if not active[t]:
+            continue
+        denom = V[t:][active[t:]].sum()                       # remaining expected volume
+        if denom <= 0:
+            continue
+        base_t = remaining * V[t] / denom                     # profile slice of remaining
+        f_t = 1.0
+        if t >= 1 and active[t - 1] and realised[t - 1] > 0 and V[t - 1] > 0:
+            z = np.clip(np.log(realised[t - 1] / V[t - 1]), -z_clip, z_clip)
+            f_t = float(np.exp(ar_rho * z))                   # forecast volume surprise
+        q_t = min(base_t * f_t, remaining)
+        sched[t] = q_t
+        remaining -= q_t
+    if remaining > 1e-9:
+        la = np.where(active)[0]
+        if la.size:
+            sched[la[-1]] += remaining
+
+    q_int = _largest_remainder_round(sched, total_lots)
+    return pl.Series("q_requested", q_int.astype(float), dtype=pl.Float64)
 
 
 def _simulate_fills_df(df: pl.DataFrame, *, side_col: str = "side",
