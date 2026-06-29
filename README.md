@@ -6,13 +6,21 @@ across a trading day, and reports how good that execution was (fill rate, cost,
 implementation shortfall).
 
 The goal is to have a common framework where different execution strategies can
-be plugged in and measured on the same orders and the same market data. The
-strategies fall into two groups: **deployable** ones that use no future
-information — **TWAP**, a historical-volume VWAP (`vwap_static`) and a
-cost-minimising liquidity/spread allocator (`liq_spr_static`) — and a family of
-**`omniscient`** lookahead *benchmarks* that are allowed to see the realised day
-and mark the bar the deployable strategies are chasing. (A realised-volume
-`vwap_schedule` also exists as a hindsight reference.)
+be plugged in and measured on the same orders and the same market data. They fall
+into three groups:
+
+- **Deployable** (no future information): **TWAP**; a historical-volume VWAP
+  (`vwap_static`); a cost-minimising liquidity/spread allocator (`liq_spr_static`);
+  two **adaptive** schedules that react to volume as the day unfolds
+  (`vwap_adaptive`, `vwap_adaptive_v2`); and an experimental Bayesian price-drift
+  overlay (`liq_spread_bayesdrift`).
+- **Lookahead benchmarks** (allowed to see the realised day — *not* tradeable):
+  `omniscient_vwap`, `omniscient_liq_spr`, and the full `omniscient` — the bars the
+  deployable strategies are measured against.
+- A realised-volume `vwap_schedule` is also kept as a hindsight reference.
+
+Per-bin spread/liquidity profiles come from either `build_liq_spread_curves`
+(static, all-history) or `build_rolling_curves` (trailing-window, lookahead-free).
 
 The reusable logic lives in [`execution.py`](execution.py); the
 [`trade_execution.ipynb`](trade_execution.ipynb) notebook is the driver that
@@ -106,7 +114,23 @@ much should be requested in each bin?** Everything else (the fill model, the
 metrics) is shared, so swapping strategies is the only variable when comparing.
 
 All strategies round their per-bin requests to **whole lots** — you can't trade
-fractional contracts — while still summing exactly to the order quantity.
+fractional contracts.
+
+Strategies fall into two families that differ in how they treat an unfilled
+slice:
+
+- **Static** schedules (`twap`, `vwap_static`, `liq_spr_static`, and the
+  `omniscient*` benchmarks) commit a fixed plan up front that sums exactly to the
+  order quantity. If a bin under-fills (the `2 × volume` cap or a dead bin), that
+  quantity is simply lost — they do **not** chase it.
+- **Dynamic** schedules (`vwap_adaptive`, `vwap_adaptive_v2`,
+  `liq_spread_bayesdrift`) re-plan as the day unfolds and **carry forward**: each
+  bin requests a *proportion of the lots still to fill*, and `remaining` is
+  decremented by what **actually filled** (not what was requested). A slice the
+  cap or a dead bin failed to fill rolls into the next bin instead of being lost,
+  so the requested total can exceed the order quantity while the realised fills
+  target the full order. (When you add a strategy, decide which family it belongs
+  to before wiring this in.)
 
 ### TWAP (Time-Weighted Average Price) — the baseline
 
@@ -174,24 +198,83 @@ every bin has the same spread it reduces *exactly* to volume-weighting (VWAP). I
 uses no information from the day being traded, so it is fully deployable. The
 derivation is in [`execution.py`](execution.py).
 
-### omniscient — the lookahead lower bound
+### Curves: static vs trailing (rolling)
 
-A **baseline, not a deployable strategy**: it is allowed to see the *whole day*
-for the (security, date) — the realised per-bin price, spread and liquidity — and
-chooses the per-bin lots that **minimise the actual implementation shortfall**. For
-a buy that means trading where the price turns out to be **lowest** (and the spread
-tightest); for a sell, where it is **highest**. It captures everything a schedule
-could exploit — spread, liquidity *and* intraday price drift — so it is the
-unbeatable reference the realistic strategies are measured against.
+`vwap_static` and `liq_spr_static` take a `curves` argument that can come from
+either builder, and any strategy accepts either (same
+`{(qcode, date): {bin: (spread, volume)}}` shape):
 
-It is the same convex cost minimisation as `liq_spr_static`, plus a (side-signed)
-price term and the `2 × volume` fill cap as an upper bound on each bin. Respecting
-that cap means it **fills 100%** whenever the order fits the day's capacity
-(`quantity ≤ Σ 2 × volume` over fillable bins); only when the order is larger than
-the entire day can absorb — even maxing out every bin — does it leave a remainder
-unfilled. In a quick demo run its implementation shortfall is far below every other
-strategy (it times the price perfectly), which is exactly what a lower bound should
-look like.
+- **`build_liq_spread_curves`** — averages each bin over **all** days. Simple, but
+  its "no same-day lookahead" still leaks the future profile (it includes days
+  *after* the order).
+- **`build_rolling_curves`** — estimates each `(qcode, bin)` from only that qcode's
+  **previous N trading days** (default 22), strictly before the order date — the
+  genuinely lookahead-free version used in the full back-test. A qcode's first day
+  has no history, so those orders fall back to TWAP.
+
+### Adaptive VWAP — `vwap_adaptive`, `vwap_adaptive_v2` (experimental)
+
+Both start from the (rolling) volume profile and **tilt the remaining schedule
+toward bins that recent volume suggests will be busier**, exploiting the one
+genuinely predictable intraday signal we found: **volume clustering** — the
+deseasonalised volume residual is persistent (AR(1) ρ ≈ 0.5). Neither uses price
+information; both are strictly causal (only volume from *completed* bins), round
+to whole lots, and **carry forward** unfilled lots (their per-bin weight is applied
+to the lots still to fill — see the static/dynamic note above).
+
+- **`vwap_adaptive`** — causal receding-horizon form: at each bin it measures the
+  recent volume *surprise* and re-forecasts **every** remaining bin with the
+  surprise decaying by horizon (`exp(ρ^h · surprise)`), so near bins tilt while the
+  tail reverts to the static profile; allocates in proportion to the forecast
+  (vectorised, no loop).
+- **`vwap_adaptive_v2`** — simpler myopic form: scales only the **next** slice by a
+  one-step surprise forecast `exp(ρ · z_{t-1})`, trades it, then renormalises the
+  remainder over the rest (the constant-participation framing).
+
+`ρ` is a **fixed structural constant** (default 0.5, the measured pooled value), not
+fitted to the executed day. Both are experimental — kept side by side to compare.
+
+### liq_spread_bayesdrift — Bayesian drift overlay (experimental)
+
+`liq_spr_static` made adaptive with a **price-drift** estimate: each bin it updates
+a Bayesian posterior drift from the realised price path (standard-normal prior),
+re-plans the remaining bins with that drift (front-load a buy into an up-trend,
+etc.), and only tilts when the drift's **signal-to-noise ratio** clears a threshold.
+It rides price *momentum*, which — unlike volume clustering — we found is largely
+unpredictable (and mean-reverts for index futures), so it does **not** robustly beat
+the baselines; kept as a diagnostic. Being dynamic, it **carries forward** unfilled
+lots: each bin re-solves over the lots still to fill and the last active bin absorbs
+whatever is outstanding.
+
+---
+
+## Lookahead benchmarks (not deployable)
+
+These are allowed to see the **realised day** and trade against it — the unbeatable
+bars the deployable strategies are measured against, *not* strategies you could run
+live. All three respect the `2 × volume` fill cap, so they fill 100% whenever the
+order fits the day's capacity.
+
+### omniscient_vwap — liquidity-only benchmark
+
+Tracks the **realised** volume profile (perfect foresight of *volume* only): trades
+each bin in proportion to that day's actual volume. The classic VWAP benchmark
+execution is normally scored against — like `vwap_static`, but on the real day's
+volume instead of the historical curve.
+
+### omniscient_liq_spr — liquidity + spread benchmark
+
+Minimises the fill model's **spread cost** on the realised spread and volume (no
+price drift) — the cost-min `liq_spr` allocation with perfect foresight of the day's
+spread/liquidity.
+
+### omniscient — full lower bound (liquidity + spread + drift)
+
+The strongest: also uses realised **price drift**, so it minimises the *actual*
+implementation shortfall (buy where the price turns out lowest, sell where highest).
+It exploits everything possible — the theoretical floor. Because drift isn't
+realistically predictable, this is an *unattainable* bound; the two above are the
+*achievable* benchmarks.
 
 > More strategies will be documented here as they are added.
 
@@ -206,7 +289,7 @@ Each order collapses to a single row of execution metrics. At a glance:
 - **`participation_overall`** — your share of total market volume over the day
   (how aggressive the execution was).
 - **`avg_fill_price`** — the volume-weighted price you actually transacted at.
-- **`total_cost`** — pure spread friction paid, always ≥ 0.
+- **`total_cost`** / **`total_realised_impact`** — total realised market impact ($), the `Σ x·s·q_filled` cost from the fill model; always ≥ 0 (two names for the same quantity).
 - **`exec_slippage_bps`** — slippage of the filled portion vs the pre-trade
   benchmark price, in basis points, **signed so positive = worse**. Includes
   both spread and intraday price drift.
@@ -221,10 +304,24 @@ remainder's opportunity cost is marked at the **terminal price** — the last bi
 VWAP.
 
 `is_bps` also comes pre-split into three additive pieces — `is_slippage_bps`
-(spread cost), `is_drift_bps` (realised price drift on the filled part), and
-`is_opportunity_bps` (the unfilled remainder vs arrival) — which sum to `is_bps`.
+(total **realised impact**, `Σ x·s·q_filled`, in bps), `is_drift_bps` (realised
+price drift on the filled part), and `is_opportunity_bps` (the unfilled remainder
+vs arrival) — which sum to `is_bps`. (`decompose_is_stats` labels the first piece
+`realised_impact`.)
 `decompose_is(summary)` averages them across orders so you can see where the
-shortfall actually came from.
+shortfall actually came from (and `decompose_is_stats` gives per-component
+mean / median / variance, per strategy).
+
+There is also a separate, **drift-free** score — the **order-impact** (market-impact
+shortfall): the realised spread cost on the filled lots **plus** an opportunity
+cost that crosses **half the closing spread** on the shortfall
+(`0.5 · terminal_spread · unfilled`), i.e. the cost of cleaning up the unfilled
+lots at the close. It excludes price drift on purpose (we aren't forecasting
+drift). `asset_impact(summary)` aggregates it per **qcode** as notional-weighted
+bps (`Σ impact / Σ notional × 1e4`, with realised + opportunity adding to the
+total), and `order_impact_stats(summary, label)` gives a one-row-per-strategy
+summary — `$` totals plus bps averaged across assets, split into `realised_bps` /
+`opportunity_bps` / `total_impact_bps`.
 
 > **Full column-by-column reference:** see
 > [`docs/execution_metrics.md`](docs/execution_metrics.md). It documents every

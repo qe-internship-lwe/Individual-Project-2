@@ -86,6 +86,8 @@ __all__ = [
     "summarise_fills",
     "decompose_is",
     "decompose_is_stats",
+    "asset_impact",
+    "order_impact_stats",
     "SLIPPAGE_BASE",
     "SLIPPAGE_COEF",
     "FILL_CAP_MULTIPLE",
@@ -105,6 +107,7 @@ __all__ = [
 SLIPPAGE_BASE: float = 0.1       # x = SLIPPAGE_BASE + SLIPPAGE_COEF * sqrt(p)
 SLIPPAGE_COEF: float = 0.2828    # ~= 0.4 / sqrt(2): gives x = 0.5 at the p = 2 cap
 FILL_CAP_MULTIPLE: float = 2.0   # q_filled <= FILL_CAP_MULTIPLE * VOLUME
+CROSS_SPREAD_FRACTION: float = 0.5  # opportunity cost: cross half the terminal spread on the shortfall
 
 
 class BinFill(NamedTuple):
@@ -688,6 +691,45 @@ def _per_bin_curve(bins: pl.DataFrame, curves: dict) -> dict:
     return curves.get(bins.get_column(SECURITY_COL)[0], {})
 
 
+def _fill_capacity(bins: pl.DataFrame):
+    """Per-bin ``(fillable, cap)`` exactly as the fill model sees it.
+
+    ``fillable`` is True iff ``volume``, ``vwap``, ``twa_ask``, ``twa_bid`` are all
+    present and ``volume > 0`` (the only bins that can fill); ``cap = 2 * volume``
+    is the most that can fill there. Used by the **dynamic** strategies to carry
+    unfilled lots forward (track lots-still-to-fill rather than lots-requested).
+    """
+    vol = (bins.get_column(VOLUME_COL).cast(pl.Float64).fill_null(0.0).fill_nan(0.0).to_numpy())
+    vwap = bins.get_column(VWAP_COL).cast(pl.Float64).to_numpy()
+    ask = bins.get_column(ASK_COL).cast(pl.Float64).to_numpy()
+    bid = bins.get_column(BID_COL).cast(pl.Float64).to_numpy()
+    fillable = (vol > 0) & np.isfinite(vwap) & np.isfinite(ask) & np.isfinite(bid)
+    return fillable, FILL_CAP_MULTIPLE * vol
+
+
+def _carry_forward_exec(weights: np.ndarray, total: int, fillable: np.ndarray,
+                        cap: np.ndarray, last_idx: int) -> np.ndarray:
+    """Execute fraction-of-remaining ``weights`` against lots-still-to-FILL.
+
+    At each bin request ``round(weights_k * remaining)`` lots (the last allocatable
+    bin ``last_idx`` sweeps up all that's left), then decrement ``remaining`` by the
+    **actual** causal fill ``min(request, cap_k)`` (0 in a non-fillable bin) - so a
+    slice that doesn't fill rolls forward into later bins. Whole lots throughout;
+    no lookahead (bin k uses only its own ``remaining``, which reflects fills < k).
+    """
+    n = len(weights)
+    sched = np.zeros(n, dtype=float)
+    remaining = float(total)
+    for k in range(n):
+        if remaining <= 0.5:
+            break
+        q = remaining if k == last_idx else min(float(round(weights[k] * remaining)), remaining)
+        sched[k] = q
+        if fillable[k]:
+            remaining -= min(q, cap[k])
+    return sched
+
+
 def vwap_static(bins: pl.DataFrame, quantity: float, *,
                 curves: dict, **_: object) -> pl.Series:
     """VWAP weighted by the **static historical** volume curve (no lookahead).
@@ -894,21 +936,22 @@ def vwap_adaptive(bins: pl.DataFrame, quantity: float, *,
        Far bins (``rho**h -> 0``) revert to ``u[f]`` - i.e. the schedule's tail is
        exactly the static profile, so this degrades gracefully to
        :func:`vwap_static` when there is no signal (and *is* it at the open).
-    3. **Allocate** the still-unscheduled quantity in proportion to ``v_hat``,
-       request bin ``k``, advance.
+    3. **Allocate** in proportion to ``v_hat`` over the remaining bins. The
+       weights ``a_k = v_hat_k / sum_{f>=k} v_hat_f`` are the *proportion of
+       lots-still-to-fill* to request in bin ``k``; bin ``k``'s request is
+       ``round(a_k * remaining)`` whole lots, and ``remaining`` is then decremented
+       by the **actually filled** lots (``min(request, 2*volume)`` on fillable
+       bins) - so a slice the ``2*volume`` cap or a dead bin failed to fill rolls
+       **forward** into the next bin rather than being lost (carry-forward).
 
-    This is implemented as the causal telescoping form
-    ``a_k = v_hat_k / sum_{f>=k} v_hat_f`` followed by **cumulative rounding** of
-    ``cum_k = X * (1 - prod_{j<=k}(1 - a_j))`` to whole lots - fully vectorised, no
-    Python loop, and every ``a_k`` (and the cumulative target through ``k``) depends
-    only on ``s_k`` (hence on ``volume[< k]``). Cumulative rounding is essential:
-    a global largest-remainder pass would assign leftover lots by whole-day
-    fractional rank, letting a later bin flip an earlier bin's lots. It uses **no
-    same-day future information**: bin ``k``'s request is invariant to any change
-    in ``volume[k:]`` (see the causality self-test in the notebook). The
-    ``2 * volume`` fill cap is *not* fed back here (no unfilled carryover) so the
-    schedule stays a pure function of past volume; carryover would make it
-    path-dependent on realised fills and is left as a separate option.
+    This is a **dynamic** strategy: the schedule is driven by realised fills, so
+    carry-forward applies. The hazard weights ``a_k`` are the causal telescoping
+    form and depend only on ``s_k`` (hence on ``volume[< k]``): bin ``k``'s
+    *weight* is invariant to any change in ``volume[k:]`` (see the causality
+    self-test in the notebook). Whole-lot integrality comes from rounding each
+    committed slice (not a global largest-remainder pass, which could let a later
+    bin flip an earlier bin's lots). The last active bin receives all lots still
+    outstanding so the order is fully scheduled.
 
     Parameters
     ----------
@@ -938,9 +981,11 @@ def vwap_adaptive(bins: pl.DataFrame, quantity: float, *,
     Returns
     -------
     pl.Series
-        Integer-valued float series of length ``len(bins)`` summing to
-        ``round(quantity)``. Falls back to :func:`twap_schedule` when no trailing
-        profile exists (e.g. a qcode's first day).
+        Integer-valued float series of length ``len(bins)``. Whole lots; because
+        unfilled lots **carry forward** and get re-requested, the requested total
+        is ``>= round(quantity)`` (it converges so realised fills target the full
+        order). Falls back to :func:`twap_schedule` when no trailing profile exists
+        (e.g. a qcode's first day).
     """
     n = bins.height
     if n == 0:
@@ -992,17 +1037,16 @@ def vwap_adaptive(bins: pl.DataFrame, quantity: float, *,
     a = np.where(denom > 0, np.diag(vhat) / np.where(denom > 0, denom, 1.0), 0.0)
     a = np.clip(a, 0.0, 1.0)
 
-    # Causal CUMULATIVE rounding. The cumulative target through bin k,
-    #   cum_k = X * (1 - prod_{j<=k}(1 - a_j)),
-    # depends only on a_0..a_k (hence volume[:k]); differencing its rounded value
-    # gives whole lots whose bin-k entry is a function of past volume only.
-    # (A global largest-remainder round would assign the +/-1 leftovers by
-    # whole-day fractional rank, letting a LATER bin flip an earlier bin -> lookahead.)
-    cum = total_lots * (1.0 - np.cumprod(1.0 - a))
-    cum[-1] = float(total_lots)               # last bin absorbs the rounding remainder
-    cum_round = np.rint(cum)
-    req_int = np.diff(np.concatenate([[0.0], cum_round]))
-    return pl.Series("q_requested", req_int.astype(float), dtype=pl.Float64)
+    # --- causal carry-forward execution (DYNAMIC strategy) ---
+    # a_k is the fraction of the *remaining* lots to execute at bin k. Run it
+    # against lots-still-to-FILL: an unfilled slice (dataless bin / 2*V cap) rolls
+    # into later bins rather than being lost, so the order actually completes (up to
+    # capacity). The last allocatable bin sweeps up the residual. Still causal -
+    # bin k only uses `remaining`, which reflects fills strictly before k.
+    fillable, cap = _fill_capacity(bins)
+    last_idx = int(np.max(np.where(a > 0))) if np.any(a > 0) else (n - 1)
+    sched = _carry_forward_exec(a, total_lots, fillable, cap, last_idx)
+    return pl.Series("q_requested", sched, dtype=pl.Float64)
 
 
 def _solve_omniscient_q(total_lots: int, base: np.ndarray, s: np.ndarray,
@@ -1298,11 +1342,18 @@ def liq_spread_bayesdrift(bins: pl.DataFrame, quantity: float, *,
 
     Then it solves the drift-adjusted allocation
     ``q_k* = V_k*max(0,(mu - D_k)/(0.4242*s_k) - 0.2357)^2`` over the **remaining**
-    bins for the **remaining** quantity, and commits only bin ``t``'s slice before
-    rolling forward. For a buy in an up-trend (alpha*>0) future bins look dearer,
-    so it front-loads; a down-trend back-loads. Only prices from bins ``<= t`` are
-    used (no lookahead). The continuous plan is largest-remainder rounded to whole
-    lots and sums to ``round(quantity)``.
+    bins for the lots **still to fill**, and commits only bin ``t``'s slice
+    (``round(q_t*)`` whole lots) before rolling forward. For a buy in an up-trend
+    (alpha*>0) future bins look dearer, so it front-loads; a down-trend back-loads.
+    Only prices from bins ``<= t`` are used (no lookahead).
+
+    This is a **dynamic** strategy, so it carries forward: ``remaining`` is
+    decremented by the **actually filled** lots (``min(request, 2*volume)`` on
+    fillable bins), so a slice the ``2*volume`` cap or a dead bin failed to fill
+    rolls into the re-solve at the next bin instead of being lost. Re-solving over
+    the remaining bins each step makes the last active bin absorb whatever is still
+    outstanding, so the order is fully scheduled in whole lots without a separate
+    leftover-dump or global rounding pass.
 
     Parameters
     ----------
@@ -1328,9 +1379,11 @@ def liq_spread_bayesdrift(bins: pl.DataFrame, quantity: float, *,
     Returns
     -------
     pl.Series
-        Integer-valued float series of length ``len(bins)`` summing to
-        ``round(quantity)``. Falls back to the integer-lot TWAP split if no
-        rolling curve exists for this (qcode, date) or nothing is tradeable.
+        Integer-valued float series of length ``len(bins)``. Whole lots; because
+        unfilled lots **carry forward** and get re-requested, the requested total
+        is ``>= round(quantity)`` (realised fills target the full order). Falls
+        back to the integer-lot TWAP split if no rolling curve exists for this
+        (qcode, date) or nothing is tradeable.
     """
     n = bins.height
     if n == 0:
@@ -1355,10 +1408,11 @@ def liq_spread_bayesdrift(bins: pl.DataFrame, quantity: float, *,
     finite_opens = opens[np.isfinite(opens)]
     S0 = finite_opens[0] if finite_opens.size else np.nan
 
+    fillable, cap = _fill_capacity(bins)                      # carry-forward (DYNAMIC)
     sched = np.zeros(n, dtype=float)
     remaining = float(total_lots)
     for t in range(n):
-        if remaining <= 1e-9:
+        if remaining <= 0.5:
             break
         rem = np.arange(t, n)
         am = active[rem]
@@ -1377,18 +1431,14 @@ def liq_spread_bayesdrift(bins: pl.DataFrame, quantity: float, *,
                 if snr >= snr_min:                            # only tilt when confident
                     D = sign * alpha * (rem - t).astype(float)
         ra = rem[am]
+        # re-solve over the remaining bins for lots-STILL-TO-FILL, commit bin t only;
+        # decrement by the actual fill so an unfilled slice rolls forward.
         q_rem = _solve_drift_q(remaining, D[am], s_eff[ra], v[ra])
-        q_t = float(q_rem[0]) if active[t] else 0.0           # commit bin t only
-        q_t = min(q_t, remaining)
+        q_t = min(float(round(q_rem[0])) if active[t] else 0.0, remaining)
         sched[t] = q_t
-        remaining -= q_t
-    if remaining > 1e-9:                                       # dump any residual on last active bin
-        la = np.where(active)[0]
-        if la.size:
-            sched[la[-1]] += remaining
-
-    q_int = _largest_remainder_round(sched, total_lots)
-    return pl.Series("q_requested", q_int.astype(float), dtype=pl.Float64)
+        if fillable[t]:
+            remaining -= min(q_t, cap[t])
+    return pl.Series("q_requested", sched, dtype=pl.Float64)
 
 
 def vwap_adaptive_v2(bins: pl.DataFrame, quantity: float, *,
@@ -1408,16 +1458,21 @@ def vwap_adaptive_v2(bins: pl.DataFrame, quantity: float, *,
         z_{t-1} = log(realised_volume_{t-1} / V_{t-1})       (last bin's surprise)
         f_t     = exp(ar_rho * z_{t-1})                      (forecast surprise, clipped)
 
-    then trades ``q_t = (this bin's profile slice of the remaining qty) * f_t`` -
+    then trades ``q_t = round(w_t * remaining)`` where the weight
+    ``w_t = (V_t / sum_{f>=t} V_f) * f_t`` is the surprise-scaled profile share -
     i.e. **participate more when more volume is expected** (constant participation
-    against forecast volume) - and **renormalises the remaining quantity over the
-    remaining bins** afterwards. It does NOT re-optimise the whole schedule; it
-    scales the next slice by the surprise, trades, then re-spreads the remainder.
+    against forecast volume) - applied to the lots **still to fill**.
 
-    Only completed bins (``< t``) are read, so there's no lookahead. Continuous
-    internally, largest-remainder rounded to whole lots summing to
-    ``round(quantity)``. This rides the *volume-clustering* signal (real,
-    universal) rather than price drift (not forecastable).
+    This is a **dynamic** strategy, so it carries forward: ``remaining`` is
+    decremented by the **actually filled** lots (``min(request, 2*volume)`` on
+    fillable bins), so a slice the ``2*volume`` cap or a dead bin failed to fill
+    rolls into the next bin's weight*remaining rather than being lost, and the last
+    active bin absorbs whatever is outstanding. Whole lots come from rounding each
+    committed slice (no global largest-remainder pass).
+
+    Only completed bins (``< t``) are read, so there's no lookahead. This rides the
+    *volume-clustering* signal (real, universal) rather than price drift (not
+    forecastable).
 
     Parameters
     ----------
@@ -1440,9 +1495,11 @@ def vwap_adaptive_v2(bins: pl.DataFrame, quantity: float, *,
     Returns
     -------
     pl.Series
-        Integer-valued float series of length ``len(bins)`` summing to
-        ``round(quantity)``; falls back to the integer-lot TWAP split when no
-        rolling curve exists or nothing is tradeable.
+        Integer-valued float series of length ``len(bins)``. Whole lots; because
+        unfilled lots **carry forward** and get re-requested, the requested total
+        is ``>= round(quantity)`` (realised fills target the full order); falls
+        back to the integer-lot TWAP split when no rolling curve exists or nothing
+        is tradeable.
     """
     n = bins.height
     if n == 0:
@@ -1462,31 +1519,22 @@ def vwap_adaptive_v2(bins: pl.DataFrame, quantity: float, *,
     if not active.any():
         return twap_schedule(bins, total_lots)
 
-    sched = np.zeros(n, dtype=float)
-    remaining = float(total_lots)
-    for t in range(n):
-        if remaining <= 1e-9:
-            break
-        if not active[t]:
-            continue
-        denom = V[t:][active[t:]].sum()                       # remaining expected volume
-        if denom <= 0:
-            continue
-        base_t = remaining * V[t] / denom                     # profile slice of remaining
-        f_t = 1.0
-        if t >= 1 and active[t - 1] and realised[t - 1] > 0 and V[t - 1] > 0:
+    # Per-bin weight = (renormalised volume share of the remaining bins) * surprise,
+    # i.e. the fraction of the *remaining* lots to do at this bin. f_t uses only the
+    # previous bin's realised volume (causal).
+    fillable, cap = _fill_capacity(bins)
+    Vc = np.where(active, V, 0.0)
+    rev = np.cumsum(Vc[::-1])[::-1]                        # rev[t] = sum_{j>=t} V_j (active)
+    f = np.ones(n)
+    for t in range(1, n):
+        if active[t - 1] and realised[t - 1] > 0 and V[t - 1] > 0:
             z = np.clip(np.log(realised[t - 1] / V[t - 1]), -z_clip, z_clip)
-            f_t = float(np.exp(ar_rho * z))                   # forecast volume surprise
-        q_t = min(base_t * f_t, remaining)
-        sched[t] = q_t
-        remaining -= q_t
-    if remaining > 1e-9:
-        la = np.where(active)[0]
-        if la.size:
-            sched[la[-1]] += remaining
-
-    q_int = _largest_remainder_round(sched, total_lots)
-    return pl.Series("q_requested", q_int.astype(float), dtype=pl.Float64)
+            f[t] = float(np.exp(ar_rho * z))              # forecast volume surprise
+    weights = np.where(active & (rev > 0), Vc / np.where(rev > 0, rev, 1.0) * f, 0.0)
+    # --- causal carry-forward (DYNAMIC strategy): apply weights to lots-still-to-FILL ---
+    last_idx = int(np.max(np.where(active))) if active.any() else (n - 1)
+    sched = _carry_forward_exec(weights, total_lots, fillable, cap, last_idx)
+    return pl.Series("q_requested", sched, dtype=pl.Float64)
 
 
 def _simulate_fills_df(df: pl.DataFrame, *, side_col: str = "side",
@@ -1870,6 +1918,9 @@ def summarise_fills(
         total_cost=pl.col("cost").sum(),
         arrival_price=pl.col(arrival_col).filter(pl.col(arrival_col).is_not_null()).first(),
         terminal_price=pl.col(VWAP_COL).filter(pl.col(VWAP_COL).is_not_null()).last(),
+        # spread of the last bin that quoted - the cost of crossing at end of day
+        # to clean up the unfilled shortfall (used by the order-impact metric).
+        terminal_spread=pl.col("spread").filter(pl.col("spread").is_not_null()).last(),
     )
 
     sign = pl.when(pl.col("side") == "buy").then(1.0).otherwise(-1.0)
@@ -1902,6 +1953,8 @@ def summarise_fills(
     opp_cur = sign * pl.col("unfilled_qty") * (pl.col("terminal_price")
                                                - pl.col("arrival_price"))
     g = g.with_columns(
+        # total realised impact ($) = sum over bins of x * s * q_filled (= total_cost).
+        pl.col("total_cost").alias("total_realised_impact"),
         pl.when(paper != 0).then(pl.col("is_currency") / paper * 1e4)
         .otherwise(None).alias("is_bps"),
         pl.when(paper != 0).then(slippage_cur / paper * 1e4)
@@ -1910,6 +1963,26 @@ def summarise_fills(
         .otherwise(None).alias("is_drift_bps"),
         pl.when(paper != 0).then(opp_cur / paper * 1e4)
         .otherwise(None).alias("is_opportunity_bps"),
+    )
+    # --- Order-impact metric (market-impact IS: realised cost + cross-the-spread
+    #     opportunity, NO drift term). Per-order $ pieces; bps are best formed at
+    #     the asset level (notional-weighted) via :func:`asset_impact`. ---
+    #   realised   = total_realised_impact = Sum_bins x*s*q_filled  (= total_cost)
+    #   opportunity= CROSS_SPREAD_FRACTION * terminal_spread * unfilled_qty
+    #                (cross half the closing spread on the shortfall)
+    #   notional   = Sum_bins VWAP_bin*q_filled + VWAP_last*unfilled_qty
+    opp_impact_cur = pl.when(pl.col("unfilled_qty") > 0).then(
+        CROSS_SPREAD_FRACTION * pl.col("terminal_spread") * pl.col("unfilled_qty")
+    ).otherwise(0.0)
+    impact_notional = pl.col("filled_vwap_notional") + pl.when(pl.col("unfilled_qty") > 0).then(
+        pl.col("terminal_price") * pl.col("unfilled_qty")
+    ).otherwise(0.0)
+    g = g.with_columns(
+        opp_impact_cur.alias("opportunity_impact"),
+        impact_notional.alias("impact_notional"),
+    )
+    g = g.with_columns(
+        (pl.col("total_realised_impact") + pl.col("opportunity_impact")).alias("order_impact"),
     )
     return g
 
@@ -1957,7 +2030,8 @@ def decompose_is_stats(summary: pl.DataFrame,
                        label: Optional[str] = None) -> pl.DataFrame:
     """Per-component distribution stats of the IS decomposition (one strategy).
 
-    Returns one row per IS component - ``slippage``, ``drift``, ``opportunity``
+    Returns one row per IS component - ``realised_impact`` (the summed x*s*q_filled,
+    i.e. ``total_realised_impact`` in bps), ``drift``, ``opportunity``
     and the ``total`` (``is_bps``) - with the **mean**, **median** and (sample,
     ddof=1) **variance** in bps across orders. Orders with an undefined ``is_bps``
     are dropped. Pass ``label`` (e.g. the strategy name) to tag every row, so the
@@ -1973,18 +2047,126 @@ def decompose_is_stats(summary: pl.DataFrame,
     Returns
     -------
     pl.DataFrame
-        Columns ``[strategy?, component, mean, median, variance]`` - four rows
-        (slippage, drift, opportunity, total).
+        Columns ``[strategy?, component, mean, median, variance, fill_rate]`` -
+        four rows (realised_impact, drift, opportunity, total). ``fill_rate`` is the
+        mean fill rate across the same orders (constant within a strategy); it puts
+        the ``opportunity`` component in context, since opportunity cost is non-zero
+        only when ``fill_rate < 1``.
     """
-    comps = [("slippage", "is_slippage_bps"), ("drift", "is_drift_bps"),
+    comps = [("realised_impact", "is_slippage_bps"), ("drift", "is_drift_bps"),
              ("opportunity", "is_opportunity_bps"), ("total", "is_bps")]
     s = summary.filter(pl.col("is_bps").is_not_null() & pl.col("is_bps").is_not_nan())
+    fill = float(s.get_column("fill_rate").mean()) if "fill_rate" in s.columns else None
     recs = []
     for name, col in comps:
         c = s.get_column(col)
         rec = {"component": name, "mean": c.mean(),
-               "median": c.median(), "variance": c.var()}
+               "median": c.median(), "variance": c.var(), "fill_rate": fill}
         if label is not None:
             rec = {"strategy": label, **rec}
         recs.append(rec)
     return pl.DataFrame(recs)
+
+
+def asset_impact(summary: pl.DataFrame) -> pl.DataFrame:
+    """Per-asset (qcode) **order-impact** metric, notional-weighted across orders.
+
+    The "market-impact implementation shortfall": realised spread cost on the
+    filled lots **plus** a cross-the-spread opportunity cost on the unfilled
+    shortfall, with **no drift term** (unlike :func:`decompose_is`). For each
+    ``qcode`` it sums the per-order pieces from :func:`summarise_fills` over that
+    qcode's orders and forms notional-weighted bps::
+
+        realised_$       = Sum_orders Sum_bins  x * s * q_filled        (= total_realised_impact)
+        opportunity_$    = Sum_orders  CROSS_SPREAD_FRACTION * s_last * q_unfilled
+        impact_notional  = Sum_orders [ Sum_bins VWAP_bin*q_filled + VWAP_last*q_unfilled ]
+
+        realised_bps     = realised_$    / impact_notional * 1e4
+        opportunity_bps  = opportunity_$ / impact_notional * 1e4
+        total_impact_bps = realised_bps + opportunity_bps        (shared denominator -> additive)
+
+    Orders with a null / non-positive ``impact_notional`` (a fully dead day -
+    nothing traded and nothing to mark) are dropped.
+
+    Parameters
+    ----------
+    summary : pl.DataFrame
+        Output of :func:`summarise_fills` (needs ``qcode``, ``total_realised_impact``,
+        ``opportunity_impact``, ``impact_notional``, ``fill_rate``).
+
+    Returns
+    -------
+    pl.DataFrame
+        One row per ``qcode`` with ``n_orders``, ``fill_rate`` (mean), the three
+        ``*_$`` totals, ``impact_notional`` and ``realised_bps`` /
+        ``opportunity_bps`` / ``total_impact_bps``.
+    """
+    s = summary.filter(
+        pl.col("impact_notional").is_not_null()
+        & pl.col("impact_notional").is_not_nan()
+        & (pl.col("impact_notional") > 0)
+    )
+    g = s.group_by("qcode", maintain_order=True).agg(
+        n_orders=pl.len(),
+        fill_rate=pl.col("fill_rate").mean(),
+        realised_impact=pl.col("total_realised_impact").sum(),
+        opportunity_impact=pl.col("opportunity_impact").sum(),
+        impact_notional=pl.col("impact_notional").sum(),
+    )
+    g = g.with_columns(
+        (pl.col("realised_impact") + pl.col("opportunity_impact")).alias("total_impact"),
+        (pl.col("realised_impact") / pl.col("impact_notional") * 1e4).alias("realised_bps"),
+        (pl.col("opportunity_impact") / pl.col("impact_notional") * 1e4).alias("opportunity_bps"),
+    )
+    return g.with_columns(
+        (pl.col("realised_bps") + pl.col("opportunity_bps")).alias("total_impact_bps"),
+    )
+
+
+def order_impact_stats(summary: pl.DataFrame,
+                       label: Optional[str] = None) -> pl.DataFrame:
+    """One-row strategy summary of the order-impact metric (stack several to compare).
+
+    The ``$`` columns are summed over **all** orders; the bps columns are the
+    **mean across assets** of the per-qcode notional-weighted bps from
+    :func:`asset_impact` - i.e. reconcile assets by a simple mean (for now). The
+    realised and opportunity bps still add to ``total_impact_bps`` because each
+    qcode's pair does and the mean is linear.
+
+    Parameters
+    ----------
+    summary : pl.DataFrame
+        Output of :func:`summarise_fills`.
+    label : str, optional
+        Strategy name stamped into a leading ``strategy`` column when given.
+
+    Returns
+    -------
+    pl.DataFrame
+        Single row: ``[strategy?, fill_rate, realised_impact_$, opportunity_impact_$,
+        total_impact_$, mean_$_per_order, realised_bps, opportunity_bps,
+        total_impact_bps]``.
+    """
+    per_asset = asset_impact(summary)
+    valid = summary.filter(
+        pl.col("impact_notional").is_not_null()
+        & pl.col("impact_notional").is_not_nan()
+        & (pl.col("impact_notional") > 0)
+    )
+    n = valid.height
+    realised = float(valid.get_column("total_realised_impact").sum()) if n else 0.0
+    opp = float(valid.get_column("opportunity_impact").sum()) if n else 0.0
+    has = per_asset.height > 0
+    rec = {
+        "fill_rate": float(summary.get_column("fill_rate").mean()),
+        "realised_impact_$": realised,
+        "opportunity_impact_$": opp,
+        "total_impact_$": realised + opp,
+        "mean_$_per_order": (realised + opp) / n if n else None,
+        "realised_bps": float(per_asset.get_column("realised_bps").mean()) if has else None,
+        "opportunity_bps": float(per_asset.get_column("opportunity_bps").mean()) if has else None,
+        "total_impact_bps": float(per_asset.get_column("total_impact_bps").mean()) if has else None,
+    }
+    if label is not None:
+        rec = {"strategy": label, **rec}
+    return pl.DataFrame([rec])

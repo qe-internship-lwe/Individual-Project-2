@@ -69,6 +69,7 @@ The gap `n_bins - n_fillable` is how many bins were structurally dead
 | Column | Formula | Meaning |
 |---|---|---|
 | `total_cost` | `Σ slippage_factor × spread × q_filled` | Spread cost paid vs each bin's **own VWAP** (always ≥ 0). Pure execution friction — excludes market drift. |
+| `total_realised_impact` | `Σ x · s · q_filled` (= `total_cost`) | **Total realised market impact** ($) — the cost from the fill model's `x × s` term summed over the order's filled bins. Identical to `total_cost`; surfaced under this name, and it is the `realised_impact` component of the IS decomposition once put in bps. |
 | **`exec_slippage_bps`** | `sign × (avg_fill_price - arrival_price) / arrival_price × 1e4` | Filled-only slippage vs the arrival price, in bps. **Signed so positive = worse** (bought above / sold below arrival). Includes both spread *and* intraday price drift. |
 
 ---
@@ -117,7 +118,7 @@ sum to `is_bps` exactly, for every order:
 
 | Column | Currency formula (÷ `paper` × 1e4 for bps) | Meaning |
 |---|---|---|
-| `is_slippage_bps` | `total_cost` | Spread cost paid on the filled lots. Always ≥ 0. |
+| `is_slippage_bps` (a.k.a. **`realised_impact`**) | `total_cost` | **Total realised impact** = spread cost (`x·s·q_filled`) paid on the filled lots; always ≥ 0. Surfaced in `$` as `total_realised_impact`; `decompose_is_stats` labels this component `realised_impact`. |
 | `is_drift_bps` | `sign × (Σ q_filled×vwap − arrival_price × total_filled)` | **Realised price drift** from the arrival price to the bin VWAPs you actually filled at — the *timing* of the filled portion. Signed; negative if the market moved in your favour. |
 | `is_opportunity_bps` | `sign × unfilled_qty × (terminal_price − arrival_price)` | **Opportunity cost** of the unfilled remainder, marked at the terminal price vs arrival. Exactly `0` when `fill_rate = 1`. |
 
@@ -137,3 +138,47 @@ orders (optionally grouped by `qcode`, `trade_list`, …) alongside `n_orders` a
 `is_bps`, so you can read off "of the −11 bps mean, X bps was slippage, Y drift,
 Z opportunity." Orders with an undefined `is_bps` (e.g. a non-trading day with no
 arrival price) are dropped.
+
+---
+
+## Order impact — the market-impact shortfall (no drift)
+
+A separate, drift-free score: **what execution actually cost** (spread paid on the
+filled lots) **plus** the cost of cleaning up the shortfall by crossing the spread
+at the close. It deliberately excludes the price-drift term of `is_bps` — we are
+not trying to forecast drift, so it is not charged here.
+
+### Per-order columns (added by `summarise_fills`)
+
+| Column | Formula | Meaning |
+|---|---|---|
+| `total_realised_impact` | `Σ x·s·q_filled` | Realised market impact ($) — spread cost on the filled lots (same as `total_cost`). |
+| `terminal_spread` | last quoting bin's `twa_ask − twa_bid` | Closing spread, used to price the clean-up. |
+| `opportunity_impact` | `0.5 · terminal_spread · unfilled_qty` | **Opportunity cost** ($): cross **half** the closing spread (`CROSS_SPREAD_FRACTION = 0.5`) on the unfilled remainder — the cost of buying the shortfall at end of day. `0` when filled 100%. |
+| `impact_notional` | `Σ VWAP_bin·q_filled + VWAP_last·unfilled_qty` | Denominator: filled lots at their bin VWAP plus the unfilled remainder marked at the terminal VWAP. |
+| `order_impact` | `total_realised_impact + opportunity_impact` | Total order impact ($). |
+
+So the headline, in bps:
+
+```
+Total Order Impact (bps) = ( Σ x·s·q_filled + 0.5·s_last·q_unfilled )
+                         / ( Σ VWAP_bin·q_filled + VWAP_last·q_unfilled ) × 1e4
+```
+
+### Aggregating — `asset_impact(summary)` and `order_impact_stats(summary, label)`
+
+- **`asset_impact`** — one row per **qcode**. Sums `total_realised_impact`,
+  `opportunity_impact` and `impact_notional` across that asset's orders, then forms
+  **notional-weighted** bps (`Σ impact / Σ notional × 1e4`). `realised_bps` and
+  `opportunity_bps` share the one denominator, so they add to `total_impact_bps`
+  exactly. Orders with null/non-positive `impact_notional` (a fully dead day — no
+  terminal price to mark against, same convention as `is_bps`) are dropped.
+- **`order_impact_stats`** — one row per **strategy** (stack several to compare).
+  The `*_$` columns are summed over all orders; the bps columns are the **mean
+  across assets** of the `asset_impact` bps (reconciling assets by a simple mean,
+  for now). Columns: `fill_rate`, `realised_impact_$`, `opportunity_impact_$`,
+  `total_impact_$`, `mean_$_per_order`, `realised_bps`, `opportunity_bps`,
+  `total_impact_bps`.
+
+This is distinct from `decompose_is` / `is_bps`, which is the full drift-inclusive
+shortfall vs the arrival price and is still recorded unchanged.
