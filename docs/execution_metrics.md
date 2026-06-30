@@ -191,3 +191,34 @@ Total Order Impact (bps) = ( Σ x·s·q_filled + 0.5·s_last·q_unfilled )
 
 This is distinct from `decompose_is` / `is_bps`, which is the full drift-inclusive
 shortfall vs the arrival price and is still recorded unchanged.
+
+---
+
+## Participation dispersion — how flat was the schedule?
+
+A *shape* diagnostic (not a cost): how far the strategy's intraday participation
+strays from a flat, volume-matching profile. For one order, with per-bin
+market-volume share `v_k = volume_k / Σ volume`, actual participation
+`p_k = q_filled_k / volume_k`, and overall participation `P = Σ q_filled / Σ volume`:
+
+```
+σ_p  = sqrt( Σ_k v_k (p_k − P)² )      # volume-weighted std of participation
+CV_p = σ_p / P                          # coefficient of variation
+```
+
+`P` is exactly the volume-weighted mean of `p_k`, so `σ_p` is the volume-weighted
+**standard deviation** of per-bin participation and `CV_p` its coefficient of
+variation. A schedule that perfectly tracks volume has `p_k = P` everywhere, so
+`σ_p = 0` — **`omniscient_vwap` is the sanity check** (its CV is ~0, with a small
+residual from whole-lot rounding that is amplified by dividing by the low
+participation `P`; it shrinks toward 0 as order size / participation grows). Bins
+with no market volume contribute nothing (`v_k = 0`, `p_k = 0`).
+
+- **`participation_dispersion(fills, by="order_id")`** — one row per order:
+  identifiers, `n_bins`, `total_volume`, `total_filled`, `target_participation`
+  (`P`), `participation_var` (`σ_p²`), `participation_vol` (`σ_p`) and
+  `participation_cv` (`CV_p`). Operates on the **per-bin fills**, not the summary.
+- **`participation_stats(disp, label)`** — one row per strategy: `n_orders`,
+  `mean_target_participation`, `mean_participation_vol`, `mean_participation_var`,
+  and the headline `mean_cv` / `median_cv` (averaged over orders; orders with no
+  traded volume are dropped).

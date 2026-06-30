@@ -308,6 +308,14 @@ summary — `$` totals plus bps both **averaged across assets** (`realised_bps` 
 `$` totals). The two can differ markedly when opportunity concentrates in
 illiquid, low-fill names.
 
+Finally there's a **shape** diagnostic — **participation dispersion** — for how
+flat a schedule's intraday participation is: the volume-weighted volatility
+`σ_p = sqrt(Σ v_k (p_k − P)²)` of per-bin participation `p_k = q_filled_k/volume_k`
+around the overall rate `P`, and its coefficient of variation `CV_p = σ_p/P`. A
+perfect volume-tracker has `p_k = P` everywhere so `σ_p ≈ 0` — `omniscient_vwap`
+is the sanity check. `participation_dispersion(fills)` gives it per order and
+`participation_stats(disp, label)` the mean/median CV per strategy.
+
 > **Full column-by-column reference:** see
 > [`docs/execution_metrics.md`](docs/execution_metrics.md). It documents every
 > field `summarise_fills` produces and, importantly, explains how the three

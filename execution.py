@@ -86,6 +86,8 @@ __all__ = [
     "decompose_is_stats",
     "asset_impact",
     "order_impact_stats",
+    "participation_dispersion",
+    "participation_stats",
     "SLIPPAGE_BASE",
     "SLIPPAGE_COEF",
     "FILL_CAP_MULTIPLE",
@@ -1929,6 +1931,125 @@ def order_impact_stats(summary: pl.DataFrame,
         "realised_bps_nw": realised * scale if scale is not None else None,
         "opportunity_bps_nw": opp * scale if scale is not None else None,
         "total_impact_bps_nw": (realised + opp) * scale if scale is not None else None,
+    }
+    if label is not None:
+        rec = {"strategy": label, **rec}
+    return pl.DataFrame([rec])
+
+
+def participation_dispersion(fills: pl.DataFrame, *, by: str = "order_id",
+                             extra_cols: Sequence[str] = ("trade_list",)) -> pl.DataFrame:
+    r"""Per-order **weighted participation volatility** ``sigma_p`` and its CV.
+
+    Measures how far a strategy's intraday participation strays from a flat,
+    volume-matching profile. For one order, with per-bin market-volume share
+    ``v_k = vol_k / sum(vol)``, actual participation ``p_k = q_filled_k / vol_k``,
+    and overall (target) participation ``P = sum(q_filled) / sum(vol)``::
+
+        sigma_p = sqrt( sum_k  v_k * (p_k - P)^2 )        # volume-weighted std of p_k
+        CV_p    = sigma_p / P
+
+    ``P`` is exactly the volume-weighted mean of ``p_k`` (``sum_k v_k p_k =
+    sum q_filled / sum vol``), so ``sigma_p`` is the volume-weighted standard
+    deviation of the per-bin participation and ``CV_p`` its coefficient of
+    variation. A schedule that perfectly tracks volume has ``p_k = P`` in every
+    bin, giving ``sigma_p = 0`` - so **omniscient_vwap is ~0** (only whole-lot
+    rounding and the ``2*volume`` cap perturb it), which is the sanity check.
+
+    Bins with no market volume (``vol_k = 0``) get ``v_k = 0`` and ``p_k = 0``, so
+    they drop out of both the weight and the sum.
+
+    Parameters
+    ----------
+    fills : pl.DataFrame
+        Per-bin output of :func:`run_strategy` / :func:`run_trade_list` (needs the
+        grouping key, ``volume`` and ``q_filled``).
+    by : str, default ``"order_id"``
+        Order grouping key.
+    extra_cols : sequence of str, default ``("trade_list",)``
+        Identifier columns carried through (``first()`` per order) when present.
+
+    Returns
+    -------
+    pl.DataFrame
+        One row per order: identifiers, ``n_bins``, ``total_volume``,
+        ``total_filled``, ``target_participation`` (``P``), ``participation_var``
+        (``sigma_p^2``), ``participation_vol`` (``sigma_p``) and
+        ``participation_cv`` (``CV_p``). ``P``/var/vol/cv are null on a day with no
+        traded volume.
+
+    Examples
+    --------
+    Flat participation (p_k = P everywhere) gives zero volatility and CV:
+
+    >>> import polars as pl
+    >>> f = pl.DataFrame({"order_id": [0, 0], "volume": [100.0, 300.0],
+    ...                   "q_filled": [10.0, 30.0]})
+    >>> d = participation_dispersion(f)
+    >>> round(d["participation_vol"][0], 12), round(d["participation_cv"][0], 12)
+    (0.0, 0.0)
+    """
+    has_qcode = QCODE_COL in fills.columns
+    carried = [pl.col(c).first().alias(c) for c in extra_cols if c in fills.columns]
+    ident = [pl.col(c).first().alias(c) for c in (SECURITY_COL, DATE_COL, "side")
+             if c in fills.columns]
+    vol = pl.col(VOLUME_COL).cast(pl.Float64).fill_null(0.0)
+    fq = pl.col("q_filled").cast(pl.Float64).fill_null(0.0)
+    pk = pl.when(vol > 0).then(fq / vol).otherwise(0.0)        # per-bin participation p_k
+    tot = vol.sum()
+    P = fq.sum() / tot                                         # overall participation = weighted mean of p_k
+    wvar = (vol * (pk - P).pow(2)).sum() / tot                 # sum_k v_k (p_k - P)^2
+
+    g = fills.group_by(by, maintain_order=True).agg(
+        *carried, *ident,
+        qcode=(pl.col(QCODE_COL).first() if has_qcode else pl.lit(None)),
+        n_bins=pl.len(),
+        total_volume=vol.sum(),
+        total_filled=fq.sum(),
+        target_participation=pl.when(tot > 0).then(P).otherwise(None),
+        participation_var=pl.when(tot > 0).then(wvar).otherwise(None),
+    )
+    g = g.with_columns(pl.col("participation_var").sqrt().alias("participation_vol"))
+    return g.with_columns(
+        pl.when(pl.col("target_participation") > 0)
+        .then(pl.col("participation_vol") / pl.col("target_participation"))
+        .otherwise(None).alias("participation_cv")
+    )
+
+
+def participation_stats(disp: pl.DataFrame,
+                        label: Optional[str] = None) -> pl.DataFrame:
+    """One-row strategy summary of participation dispersion (stack to compare).
+
+    Averages the per-order :func:`participation_dispersion` outputs - the headline
+    is ``mean_cv`` (mean coefficient of variation across orders). Orders with an
+    undefined CV (no traded volume / ``P = 0``) are dropped.
+
+    Parameters
+    ----------
+    disp : pl.DataFrame
+        Output of :func:`participation_dispersion`.
+    label : str, optional
+        Strategy name stamped into a leading ``strategy`` column when given.
+
+    Returns
+    -------
+    pl.DataFrame
+        Single row: ``[strategy?, n_orders, mean_target_participation,
+        mean_participation_vol, mean_participation_var, mean_cv, median_cv]``.
+    """
+    d = disp.filter(
+        pl.col("participation_cv").is_not_null()
+        & pl.col("participation_cv").is_not_nan()
+    )
+    has = d.height > 0
+    rec = {
+        "n_orders": d.height,
+        "mean_target_participation": float(d["target_participation"].mean()) if has else None,
+        "mean_participation_vol": float(d["participation_vol"].mean()) if has else None,
+        "mean_participation_var": float(d["participation_var"].mean()) if has else None,
+        "mean_cv": float(d["participation_cv"].mean()) if has else None,
+        "median_cv": float(d["participation_cv"].median()) if has else None,
     }
     if label is not None:
         rec = {"strategy": label, **rec}
