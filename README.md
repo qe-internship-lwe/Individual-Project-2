@@ -11,9 +11,8 @@ into three groups:
 
 - **Deployable** (no future information): **TWAP**; a historical-volume VWAP
   (`vwap_static`); a cost-minimising liquidity/spread allocator (`liq_spr_static`);
-  two **adaptive** schedules that react to volume as the day unfolds
-  (`vwap_adaptive`, `vwap_adaptive_v2`); and an experimental Bayesian price-drift
-  overlay (`liq_spread_bayesdrift`).
+  and an **adaptive** schedule that reacts to volume as the day unfolds
+  (`vwap_adaptive`).
 - **Lookahead benchmarks** (allowed to see the realised day — *not* tradeable):
   `omniscient_vwap`, `omniscient_liq_spr`, and the full `omniscient` — the bars the
   deployable strategies are measured against.
@@ -123,8 +122,8 @@ slice:
   `omniscient*` benchmarks) commit a fixed plan up front that sums exactly to the
   order quantity. If a bin under-fills (the `2 × volume` cap or a dead bin), that
   quantity is simply lost — they do **not** chase it.
-- **Dynamic** schedules (`vwap_adaptive`, `vwap_adaptive_v2`,
-  `liq_spread_bayesdrift`) re-plan as the day unfolds and **carry forward**: each
+- **Dynamic** schedules (`vwap_adaptive`) re-plan as the day unfolds and
+  **carry forward**: each
   bin requests a *proportion of the lots still to fill*, and `remaining` is
   decremented by what **actually filled** (not what was requested). A slice the
   cap or a dead bin failed to fill rolls into the next bin instead of being lost,
@@ -212,39 +211,22 @@ either builder, and any strategy accepts either (same
   genuinely lookahead-free version used in the full back-test. A qcode's first day
   has no history, so those orders fall back to TWAP.
 
-### Adaptive VWAP — `vwap_adaptive`, `vwap_adaptive_v2` (experimental)
+### Adaptive VWAP — `vwap_adaptive`
 
-Both start from the (rolling) volume profile and **tilt the remaining schedule
-toward bins that recent volume suggests will be busier**, exploiting the one
-genuinely predictable intraday signal we found: **volume clustering** — the
-deseasonalised volume residual is persistent (AR(1) ρ ≈ 0.5). Neither uses price
-information; both are strictly causal (only volume from *completed* bins), round
-to whole lots, and **carry forward** unfilled lots (their per-bin weight is applied
-to the lots still to fill — see the static/dynamic note above).
+Starts from the (rolling) volume profile and **tilts the remaining schedule toward
+bins that recent volume suggests will be busier**, exploiting the one genuinely
+predictable intraday signal we found: **volume clustering** — the deseasonalised
+volume residual is persistent (AR(1) ρ ≈ 0.5). It uses no price information; it is
+strictly causal (only volume from *completed* bins), rounds to whole lots, and
+**carries forward** unfilled lots (its per-bin weight is applied to the lots still
+to fill — see the static/dynamic note above).
 
-- **`vwap_adaptive`** — causal receding-horizon form: at each bin it measures the
-  recent volume *surprise* and re-forecasts **every** remaining bin with the
-  surprise decaying by horizon (`exp(ρ^h · surprise)`), so near bins tilt while the
-  tail reverts to the static profile; allocates in proportion to the forecast
-  (vectorised, no loop).
-- **`vwap_adaptive_v2`** — simpler myopic form: scales only the **next** slice by a
-  one-step surprise forecast `exp(ρ · z_{t-1})`, trades it, then renormalises the
-  remainder over the rest (the constant-participation framing).
-
-`ρ` is a **fixed structural constant** (default 0.5, the measured pooled value), not
-fitted to the executed day. Both are experimental — kept side by side to compare.
-
-### liq_spread_bayesdrift — Bayesian drift overlay (experimental)
-
-`liq_spr_static` made adaptive with a **price-drift** estimate: each bin it updates
-a Bayesian posterior drift from the realised price path (standard-normal prior),
-re-plans the remaining bins with that drift (front-load a buy into an up-trend,
-etc.), and only tilts when the drift's **signal-to-noise ratio** clears a threshold.
-It rides price *momentum*, which — unlike volume clustering — we found is largely
-unpredictable (and mean-reverts for index futures), so it does **not** robustly beat
-the baselines; kept as a diagnostic. Being dynamic, it **carries forward** unfilled
-lots: each bin re-solves over the lots still to fill and the last active bin absorbs
-whatever is outstanding.
+Causal receding-horizon form: at each bin it measures the recent volume *surprise*
+and re-forecasts **every** remaining bin with the surprise decaying by horizon
+(`exp(ρ^h · surprise)`), so near bins tilt while the tail reverts to the static
+profile; allocates in proportion to the forecast (vectorised, no loop). `ρ` is a
+**fixed structural constant** (default 0.5, the measured pooled value), not fitted
+to the executed day.
 
 ---
 
@@ -320,8 +302,11 @@ lots at the close. It excludes price drift on purpose (we aren't forecasting
 drift). `asset_impact(summary)` aggregates it per **qcode** as notional-weighted
 bps (`Σ impact / Σ notional × 1e4`, with realised + opportunity adding to the
 total), and `order_impact_stats(summary, label)` gives a one-row-per-strategy
-summary — `$` totals plus bps averaged across assets, split into `realised_bps` /
-`opportunity_bps` / `total_impact_bps`.
+summary — `$` totals plus bps both **averaged across assets** (`realised_bps` /
+`opportunity_bps` / `total_impact_bps`, each qcode equal-weighted) and
+**notional-weighted** across all orders (the `*_bps_nw` columns, which track the
+`$` totals). The two can differ markedly when opportunity concentrates in
+illiquid, low-fill names.
 
 > **Full column-by-column reference:** see
 > [`docs/execution_metrics.md`](docs/execution_metrics.md). It documents every

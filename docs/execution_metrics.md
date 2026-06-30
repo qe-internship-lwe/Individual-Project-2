@@ -174,11 +174,20 @@ Total Order Impact (bps) = ( Σ x·s·q_filled + 0.5·s_last·q_unfilled )
   exactly. Orders with null/non-positive `impact_notional` (a fully dead day — no
   terminal price to mark against, same convention as `is_bps`) are dropped.
 - **`order_impact_stats`** — one row per **strategy** (stack several to compare).
-  The `*_$` columns are summed over all orders; the bps columns are the **mean
-  across assets** of the `asset_impact` bps (reconciling assets by a simple mean,
-  for now). Columns: `fill_rate`, `realised_impact_$`, `opportunity_impact_$`,
-  `total_impact_$`, `mean_$_per_order`, `realised_bps`, `opportunity_bps`,
-  `total_impact_bps`.
+  The `*_$` columns are summed over all orders. The bps come **two ways**:
+  - `realised_bps` / `opportunity_bps` / `total_impact_bps` — **mean across
+    assets** of the `asset_impact` bps (each qcode counts equally; sensitive to
+    illiquid, low-fill names where opportunity is proportionally large).
+  - `realised_bps_nw` / `opportunity_bps_nw` / `total_impact_bps_nw` —
+    **notional-weighted across everything**: pool every order's `$` and
+    `impact_notional` and divide once (`Σ impact / Σ notional × 1e4`). This tracks
+    the `$` columns directly (dominated by the liquid, high-notional names).
+
+  Full column list: `fill_rate`, `realised_impact_$`, `opportunity_impact_$`,
+  `total_impact_$`, `mean_$_per_order`, then the six bps columns above. The two
+  views can differ a lot: e.g. opportunity is ~6% of realised under the asset-mean
+  but ~24% notional-weighted, because the simple mean up-weights illiquid assets
+  while the notional weighting is dominated by liquid ones.
 
 This is distinct from `decompose_is` / `is_bps`, which is the full drift-inclusive
 shortfall vs the arrival price and is still recorded unchanged.
