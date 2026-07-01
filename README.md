@@ -11,8 +11,10 @@ into three groups:
 
 - **Deployable** (no future information): **TWAP**; a historical-volume VWAP
   (`vwap_static`); a cost-minimising liquidity/spread allocator (`liq_spr_static`);
-  and an **adaptive** schedule that reacts to volume as the day unfolds
-  (`vwap_adaptive`).
+  and three **adaptive** schedules that react to volume as the day unfolds — an AR(1)
+  volume-surprise tilt (`vwap_adaptive`), a K-factor Kalman filter on the latent
+  daily volume factor (`vwap_factor`), and a per-pair OLS forecast
+  (`adaptive_volume_ols`).
 - **Lookahead benchmarks** (allowed to see the realised day — *not* tradeable):
   `omniscient_vwap`, `omniscient_liq_spr`, and the full `omniscient` — the bars the
   deployable strategies are measured against.
@@ -122,8 +124,8 @@ slice:
   `omniscient*` benchmarks) commit a fixed plan up front that sums exactly to the
   order quantity. If a bin under-fills (the `2 × volume` cap or a dead bin), that
   quantity is simply lost — they do **not** chase it.
-- **Dynamic** schedules (`vwap_adaptive`) re-plan as the day unfolds and
-  **carry forward**: each
+- **Dynamic** schedules (`vwap_adaptive`, `vwap_factor`, `adaptive_volume_ols`)
+  re-plan as the day unfolds and **carry forward**: each
   bin requests a *proportion of the lots still to fill*, and `remaining` is
   decremented by what **actually filled** (not what was requested). A slice the
   cap or a dead bin failed to fill rolls into the next bin instead of being lost,
@@ -213,20 +215,77 @@ either builder, and any strategy accepts either (same
 
 ### Adaptive VWAP — `vwap_adaptive`
 
-Starts from the (rolling) volume profile and **tilts the remaining schedule toward
-bins that recent volume suggests will be busier**, exploiting the one genuinely
-predictable intraday signal we found: **volume clustering** — the deseasonalised
-volume residual is persistent (AR(1) ρ ≈ 0.5). It uses no price information; it is
-strictly causal (only volume from *completed* bins), rounds to whole lots, and
-**carries forward** unfilled lots (its per-bin weight is applied to the lots still
-to fill — see the static/dynamic note above).
+Works in **deseasonalised log space**, anchored on the trailing-window **mean of
+log volume** `L_k` — so the baseline `exp(L_k)` is the *geometric* mean volume (the
+mean of the logs, **not** the log of the arithmetic mean), the same baseline
+convention as `vwap_factor`. As the day unfolds it **tilts the remaining schedule
+toward bins that recent volume suggests will be busier**, exploiting the one
+genuinely predictable intraday signal we found: **volume clustering** — the
+deseasonalised log-volume residual is persistent (AR(1) ρ ≈ 0.5). It uses no price
+information; it is strictly causal (only volume from *completed* bins), rounds to
+whole lots, and **carries forward** unfilled lots (see the static/dynamic note).
 
-Causal receding-horizon form: at each bin it measures the recent volume *surprise*
-and re-forecasts **every** remaining bin with the surprise decaying by horizon
-(`exp(ρ^h · surprise)`), so near bins tilt while the tail reverts to the static
-profile; allocates in proportion to the forecast (vectorised, no loop). `ρ` is a
+Causal receding-horizon form: at each bin it measures the recent *surprise* — the
+**mean of the per-bin log-deviations** `log(volume_j) − L_j` over the last `recent`
+traded bins — and re-forecasts **every** remaining bin with that surprise decaying
+by horizon, exponentiated back onto the geometric baseline:
+`v̂_f = exp(L_f) · exp(ρ^h · surprise)`. Far bins (`ρ^h → 0`) revert to `exp(L_f)`,
+so it degrades to the static geometric profile when there's no signal. `ρ` is a
 **fixed structural constant** (default 0.5, the measured pooled value), not fitted
-to the executed day.
+to the executed day. (Note: plain `vwap_static` still uses the **arithmetic** mean
+`V_k` — correct for a volume-proportional VWAP; only the adaptive/factor log-space
+forecasts use the geometric baseline.)
+
+### Factor-Kalman VWAP — `vwap_factor`
+
+The same idea as `vwap_adaptive` — forecast the rest of the day's volume from what's
+traded so far — but driven by a **K-factor state-space model** instead of a single
+AR(1) surprise. The day's intraday log-volume deviations are modelled as
+`M_k = λ_k·F + u_k`, where `F` is a small set of **latent daily volume factors**
+(1 = the dominant "busy-day" level factor) with a standard-normal prior, `λ_k` the
+per-bin loadings, and `u_k` idiosyncratic noise. The loadings `λ` and idiosyncratic
+variances `σ_u²` are estimated **once per order** by maximum-likelihood factor
+analysis on the trailing window (`build_factor_curves`, lookahead-free — day `t`
+uses days `t-LOOKBACK_DAYS … t-1`, never `t` itself).
+
+As each bin completes, a **sequential Kalman update** revises the belief `(μ, P)`
+about `F` from that bin's log-volume surprise, then the remaining bins are forecast
+as `volume_hat_m = exp(L_m + λ_m·μ)`. Each forecast is then **confidence-adjusted**
+by its predictive log-volume variance `r_m² = λ_mᵀ P λ_m + σ²_{u,m}` —
+`volume_tilde_m = volume_hat_m · exp(−r_m²/4)` (`certainty_equivalent_volume`) —
+because execution cost is convex in volume (√-impact), so uncertain bins are trusted
+less; the factor-uncertainty term shrinks as the day is observed (`P` falls), so the
+penalty relaxes. The schedule participates in proportion to `volume_tilde` over the
+lots still to fill (toggle with `ce_adjust`). It's strictly causal (bin `k` uses only
+volume `< k`), carries forward, and rounds to whole lots. For one factor the update
+is exactly the scalar Kalman recursion; for K>1 the forecast is invariant to factor
+rotation, so loadings need no rotation. **`N_FACTORS`** and **`LOOKBACK_DAYS`** are
+notebook parameters (the latter also sets the minimum history, so orders in a
+qcode's first `LOOKBACK_DAYS` trading days are dropped). Falls back to TWAP when an
+order has no factor model.
+
+### OLS Adaptive VWAP — `adaptive_volume_ols`
+
+A lighter-weight cousin of `vwap_factor`: same log-deviation set-up, but the forecast
+comes from a **per-pair OLS** rather than a factor Kalman filter. For each future bin
+`m` it uses the backward regression of `M_m` on the **most recent observed** bin `M_k`
+(the Markov / "Option A" assumption `M_m | M_1..M_k = M_m | M_k`), with the slope and
+variances read from the trailing-window cross-moments (`build_ols_curves`):
+
+- slope `β_{m|k} = ρ·σ_m/σ_k` → forecast `M̂_m = β_{m|k}·M_k`;
+- prediction variance `r_m² = σ²_{m|k} + Var(β̂)·M_k²` (residual `σ²_{m|k}=σ_m²(1−ρ²)`
+  **plus** a slope-estimation term, so a large/extrapolated surprise is trusted less).
+
+Each remaining bin is forecast `volume_hat_m = exp(L_m + M̂_m)`, **confidence-adjusted**
+`volume_tilde_m = volume_hat_m · exp(−r_m²/4)` (`certainty_equivalent_volume`, toggle
+`ce_adjust`), and the schedule participates in proportion to `volume_tilde` over the
+lots still to fill. Conditions on the latest *completed* traded bin (re-planned every
+bin), so it's strictly causal; before anything trades it uses the unconditional
+baseline (`M̂=0`, `r²=σ_m²`). Dynamic, carries forward, whole lots. Uses the global
+`LOOKBACK_DAYS` window; falls back to TWAP with no model. Being Markov it conditions on
+only the latest bin, so it tends to under-perform `vwap_factor` where the level factor
+dominates (long-lag volume correlations don't decay), but it's a simpler, transparent
+baseline.
 
 ---
 
@@ -299,9 +358,10 @@ shortfall): the realised spread cost on the filled lots **plus** an opportunity
 cost that crosses **half the closing spread** on the shortfall
 (`0.5 · terminal_spread · unfilled`), i.e. the cost of cleaning up the unfilled
 lots at the close. It excludes price drift on purpose (we aren't forecasting
-drift). `asset_impact(summary)` aggregates it per **qcode** as notional-weighted
-bps (`Σ impact / Σ notional × 1e4`, with realised + opportunity adding to the
-total), and `order_impact_stats(summary, label)` gives a one-row-per-strategy
+drift). `asset_impact(summary, by="qcode")` aggregates it per **qcode** as
+notional-weighted bps (`Σ impact / Σ notional × 1e4`, with realised + opportunity
+adding to the total) — pass `by="asset_class"` to pool bond/commodity/equity
+futures instead — and `order_impact_stats(summary, label)` gives a one-row-per-strategy
 summary — `$` totals plus bps both **averaged across assets** (`realised_bps` /
 `opportunity_bps` / `total_impact_bps`, each qcode equal-weighted) and
 **notional-weighted** across all orders (the `*_bps_nw` columns, which track the

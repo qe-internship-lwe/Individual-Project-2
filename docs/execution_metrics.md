@@ -167,9 +167,12 @@ Total Order Impact (bps) = ( Σ x·s·q_filled + 0.5·s_last·q_unfilled )
 
 ### Aggregating — `asset_impact(summary)` and `order_impact_stats(summary, label)`
 
-- **`asset_impact`** — one row per **qcode**. Sums `total_realised_impact`,
-  `opportunity_impact` and `impact_notional` across that asset's orders, then forms
-  **notional-weighted** bps (`Σ impact / Σ notional × 1e4`). `realised_bps` and
+- **`asset_impact(summary, by="qcode")`** — one row per group (`by` defaults to
+  **qcode**; pass `by="asset_class"` after joining the `qcode_mapping.csv`
+  `asset_class` column to pool bond / commodity / equity futures). Sums
+  `total_realised_impact`, `opportunity_impact` and `impact_notional` across the
+  group's orders, then forms **notional-weighted** bps (`Σ impact / Σ notional ×
+  1e4`) — a true pooled ratio, *not* an average of per-qcode bps. `realised_bps` and
   `opportunity_bps` share the one denominator, so they add to `total_impact_bps`
   exactly. Orders with null/non-positive `impact_notional` (a fully dead day — no
   terminal price to mark against, same convention as `is_bps`) are dropped.

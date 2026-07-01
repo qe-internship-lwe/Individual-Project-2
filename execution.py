@@ -88,6 +88,11 @@ __all__ = [
     "order_impact_stats",
     "participation_dispersion",
     "participation_stats",
+    "build_factor_curves",
+    "certainty_equivalent_volume",
+    "vwap_factor",
+    "build_ols_curves",
+    "adaptive_volume_ols",
     "SLIPPAGE_BASE",
     "SLIPPAGE_COEF",
     "FILL_CAP_MULTIPLE",
@@ -542,9 +547,10 @@ def build_liq_spread_curves(bins: pl.DataFrame) -> dict:
     Returns
     -------
     dict
-        Nested lookup ``{security: {bin_start_time: (s_k, V_k)}}`` for O(1) access
-        per bin inside the strategy. Pass it as
-        ``strategy_params={"curves": curves}`` to :func:`run_strategy` /
+        Nested lookup ``{security: {bin_start_time: (s_k, V_k, L_k)}}`` for O(1)
+        access per bin inside the strategy, where ``L_k`` is the mean of log volume
+        (``exp(L_k)`` = geometric-mean volume, used by :func:`vwap_adaptive`). Pass
+        it as ``strategy_params={"curves": curves}`` to :func:`run_strategy` /
         :func:`run_trade_list`.
     """
     g = (
@@ -554,11 +560,14 @@ def build_liq_spread_curves(bins: pl.DataFrame) -> dict:
         .agg(
             pl.col("_spread").mean().alias("spread_curve"),
             pl.col(VOLUME_COL).cast(pl.Float64).mean().alias("liq_curve"),
+            # mean of logs (-> geometric-mean volume exp(L_k)); used by vwap_adaptive
+            pl.when(pl.col(VOLUME_COL) > 0).then(pl.col(VOLUME_COL).cast(pl.Float64).log())
+            .otherwise(None).mean().alias("logvol_curve"),
         )
     )
     curves: dict = {}
-    for sec, bt, s_k, v_k in g.iter_rows():
-        curves.setdefault(sec, {})[bt] = (s_k, v_k)
+    for sec, bt, s_k, v_k, l_k in g.iter_rows():
+        curves.setdefault(sec, {})[bt] = (s_k, v_k, l_k)
     return curves
 
 
@@ -613,11 +622,13 @@ def build_rolling_curves(
     Returns
     -------
     dict
-        ``{(qcode, date): {bin_start_time: (s_k, V_k)}}`` for the keys in
-        ``needed`` that have at least one prior trading day. Pass as
-        ``strategy_params={"curves": curves}`` to :func:`vwap_static` /
-        :func:`liq_spr_static`, exactly like :func:`build_liq_spread_curves`;
-        those strategies look up the rolling ``(qcode, date)`` key automatically.
+        ``{(qcode, date): {bin_start_time: (s_k, V_k, L_k)}}`` for the keys in
+        ``needed`` that have at least one prior trading day, where ``L_k`` is the
+        mean of log volume over the window's traded days (``exp(L_k)`` =
+        geometric-mean volume, used by :func:`vwap_adaptive`; ``V_k`` is the
+        arithmetic mean used by :func:`vwap_static` / :func:`liq_spr_static`). Pass
+        as ``strategy_params={"curves": curves}``; strategies look up the rolling
+        ``(qcode, date)`` key automatically.
     """
     date_col = "date" if "date" in needed.columns else DATE_COL
     want: dict = {}
@@ -655,27 +666,36 @@ def build_rolling_curves(
             pl.col("vol").fill_null(0.0),
             pl.col("spr").is_not_null().cast(pl.Float64).alias("_pres"),
             pl.col("spr").fill_null(0.0).alias("_spr0"),
+        ).with_columns(
+            # log-volume on traded days only (mean of these = geometric-mean baseline)
+            (pl.col("vol") > 0).cast(pl.Float64).alias("_vpres"),
+            pl.when(pl.col("vol") > 0).then(pl.col("vol").log()).otherwise(0.0).alias("_lv"),
         ).sort(BIN_TIME_COL, DATE_COL)
         # Trailing window of `window_days`, then shift(1) to exclude the day itself.
         grid = grid.with_columns(
             pl.col("vol").rolling_mean(window_days, min_samples=1).over(BIN_TIME_COL).alias("_vinc"),
             pl.col("_spr0").rolling_sum(window_days, min_samples=1).over(BIN_TIME_COL).alias("_ssum"),
             pl.col("_pres").rolling_sum(window_days, min_samples=1).over(BIN_TIME_COL).alias("_psum"),
+            pl.col("_lv").rolling_sum(window_days, min_samples=1).over(BIN_TIME_COL).alias("_lvsum"),
+            pl.col("_vpres").rolling_sum(window_days, min_samples=1).over(BIN_TIME_COL).alias("_vpsum"),
         ).with_columns(
             pl.col("_vinc").shift(1).over(BIN_TIME_COL).alias("V_k"),
             (pl.col("_ssum") / pl.col("_psum")).shift(1).over(BIN_TIME_COL).alias("s_k"),
+            # L_k = mean of log(volume) over the window's traded days (null if none)
+            pl.when(pl.col("_vpsum") > 0).then(pl.col("_lvsum") / pl.col("_vpsum"))
+            .otherwise(None).shift(1).over(BIN_TIME_COL).alias("L_k"),
         )
         # Emit only the needed dates that have prior history (V_k not null).
         out = grid.filter(
             pl.col(DATE_COL).is_in(list(want_dates)) & pl.col("V_k").is_not_null()
-        ).select(DATE_COL, BIN_TIME_COL, "s_k", "V_k")
-        for dt, bt, s_k, v_k in out.iter_rows():
-            curves.setdefault((qc, dt), {})[bt] = (s_k, v_k)
+        ).select(DATE_COL, BIN_TIME_COL, "s_k", "V_k", "L_k")
+        for dt, bt, s_k, v_k, l_k in out.iter_rows():
+            curves.setdefault((qc, dt), {})[bt] = (s_k, v_k, l_k)
     return curves
 
 
 def _per_bin_curve(bins: pl.DataFrame, curves: dict) -> dict:
-    """Look up the per-bin ``{bin_start_time: (s_k, V_k)}`` curve for these bins.
+    """Look up the per-bin ``{bin_start_time: (s_k, V_k, L_k)}`` curve for these bins.
 
     Supports both curve flavours transparently: the trailing
     :func:`build_rolling_curves` keyed by ``(qcode, date)`` (preferred - no
@@ -914,28 +934,30 @@ def vwap_adaptive(bins: pl.DataFrame, quantity: float, *,
                   clip_s: float = 1.5, **_: object) -> pl.Series:
     """Adaptive (receding-horizon) VWAP that reacts to *realised* volume - **no lookahead**.
 
-    Starts from the trailing-window volume profile ``u_k`` (the ``V_k`` from
-    :func:`build_rolling_curves`, so the same lookahead-free anchor as
-    :func:`vwap_static`) and, as the day unfolds, tilts the schedule toward the
-    bins it now expects to be busier, using the short-horizon **volume
-    clustering** in the deseasonalised residual.
+    Works entirely in **deseasonalised log space**, anchored on the trailing-window
+    **mean of log volume** ``L_k`` (so the baseline ``exp(L_k)`` is the *geometric*
+    mean volume, the mean of the logs - **not** the log of the arithmetic mean, and
+    the same baseline convention as :func:`vwap_factor`). ``L_k`` comes from
+    :func:`build_rolling_curves` (lookahead-free); as the day unfolds the schedule
+    tilts toward bins it now expects to be busier via the short-horizon **volume
+    clustering** in the residual.
 
     At the start of bin ``k`` (using only bins ``< k``):
 
-    1. **Surprise** over the last ``recent`` observed bins, deseasonalised by the
-       same trailing profile::
+    1. **Surprise** = the **mean** of the per-bin log-deviations over the last
+       ``recent`` *traded* bins (the residual in log space)::
 
-           s_k = log( sum(realised_volume[k-recent : k]) / sum(u[k-recent : k]) )
+           s_k = mean_{j in [k-recent, k), vol_j > 0} ( log(vol_j) - L_j )
 
        (``s_0 = 0``; clipped to ``+/- clip_s`` for safety).
-    2. **Forecast** every remaining bin, surprise decaying by horizon, then
-       converted **back to the volume scale** through ``u`` (the round-trip)::
+    2. **Forecast** every remaining bin, surprise decaying by horizon, exponentiated
+       back to the volume scale on the geometric baseline::
 
-           v_hat[f] = u[f] * exp(rho ** (f - k + 1) * s_k),   f >= k
+           v_hat[f] = exp(L_f) * exp(rho ** (f - k + 1) * s_k),   f >= k
 
-       Far bins (``rho**h -> 0``) revert to ``u[f]`` - i.e. the schedule's tail is
-       exactly the static profile, so this degrades gracefully to
-       :func:`vwap_static` when there is no signal (and *is* it at the open).
+       Far bins (``rho**h -> 0``) revert to ``exp(L_f)`` - the static geometric
+       profile - so this degrades gracefully when there is no signal (and at the
+       open). (A 2-tuple curve without ``L_k`` falls back to ``log(V_k)``.)
     3. **Allocate** in proportion to ``v_hat`` over the remaining bins. The
        weights ``a_k = v_hat_k / sum_{f>=k} v_hat_f`` are the *proportion of
        lots-still-to-fill* to request in bin ``k``; bin ``k``'s request is
@@ -962,17 +984,18 @@ def vwap_adaptive(bins: pl.DataFrame, quantity: float, *,
     quantity : float
         Total lots to execute (rounded to whole lots).
     curves : dict
-        ``{(qcode, date): {bin_start_time: (s_k, V_k)}}`` from
-        :func:`build_rolling_curves` (only ``V_k`` is used as ``u_k``). The
+        ``{(qcode, date): {bin_start_time: (s_k, V_k, L_k)}}`` from
+        :func:`build_rolling_curves` (only the mean-of-log ``L_k`` is used). The
         security-keyed :func:`build_liq_spread_curves` form also works via the
-        shared lookup, but then ``u`` is static rather than trailing.
+        shared lookup, but then the baseline is static rather than trailing.
     rho : float or dict, default 0.5
         AR(1) persistence of the deseasonalised residual. A float applies to all;
         a dict is looked up by ``qcode`` (then ``(qcode, date)``), falling back to
         0.5. ``rho`` is a fixed structural constant (not fitted to the executed
         day), so it introduces no lookahead.
     recent : int, default 3
-        Number of trailing bins pooled into the surprise ``s_k``.
+        Number of trailing bins averaged into the surprise ``s_k`` (only traded
+        bins, ``vol_j > 0``, contribute).
     clip_s : float, default 1.5
         Symmetric clip on ``s_k`` (in log units) to bound the tilt.
     **_ :
@@ -996,12 +1019,21 @@ def vwap_adaptive(bins: pl.DataFrame, quantity: float, *,
 
     per_bin = _per_bin_curve(bins, curves)
     times = bins.get_column(BIN_TIME_COL).to_list()
-    u = np.array([per_bin.get(t, (np.nan, 0.0))[1] for t in times], dtype=float)
-    u = np.nan_to_num(u, nan=0.0)
-    u = np.clip(u, 0.0, None)
-    if u.sum() <= 0:
+    trips = [per_bin.get(t) for t in times]
+    Vk = np.array([(c[1] if c is not None else 0.0) for c in trips], dtype=float)
+    # mean-of-log baseline L_k (rolling curves provide it as the 3rd element); for an
+    # older 2-tuple curve fall back to log of the arithmetic mean so it still runs.
+    Lk = np.array([(c[2] if (c is not None and len(c) >= 3) else np.nan) for c in trips],
+                  dtype=float)
+    Vk = np.clip(np.nan_to_num(Vk, nan=0.0), 0.0, None)
+    Lbase = np.where(np.isfinite(Lk), Lk,
+                     np.where(Vk > 0, np.log(np.where(Vk > 0, Vk, 1.0)), np.nan))
+    active = np.isfinite(Lbase)
+    if not active.any():
         # No trailing profile (e.g. qcode's first day) -> even-split TWAP.
         return twap_schedule(bins, total_lots)
+    # baseline volume = GEOMETRIC mean exp(L_k) (mean of logs, not log of the mean)
+    base = np.where(active, np.exp(np.clip(Lbase, -50.0, 50.0)), 0.0)
 
     # resolve rho (fixed structural constant; never the executed day's data)
     if isinstance(rho, dict):
@@ -1015,24 +1047,30 @@ def vwap_adaptive(bins: pl.DataFrame, quantity: float, *,
     # realised volume, used STRICTLY causally (bin k sees only volume[:k])
     vr = bins.get_column(VOLUME_COL).cast(pl.Float64).fill_null(0.0).fill_nan(0.0).to_numpy()
 
-    eps = 1e-9
+    # surprise s_k = MEAN of the per-bin log-deviations log(vol_j) - L_j over the last
+    # `recent` traded bins (< k) - the deseasonalised residual in log space, matching
+    # the geometric baseline (not a pooled log-of-summed-volume ratio).
+    with np.errstate(divide="ignore", invalid="ignore"):
+        dev = np.where((vr > 0) & active, np.log(np.where(vr > 0, vr, 1.0)) - Lbase, np.nan)
     k_idx = np.arange(n)
     lo = np.maximum(0, k_idx - int(recent))
-    cum_v = np.concatenate([[0.0], np.cumsum(vr)])     # cum_v[k] = sum(vr[:k])
-    cum_u = np.concatenate([[0.0], np.cumsum(u)])
-    rr = cum_v[k_idx] - cum_v[lo]                       # realised over last `recent` bins (< k)
-    ru = cum_u[k_idx] - cum_u[lo]                       # expected over the same bins
-    s = np.log((rr + eps) / (ru + eps))
+    valid_dev = np.isfinite(dev).astype(float)
+    devf = np.where(np.isfinite(dev), dev, 0.0)
+    cum_d = np.concatenate([[0.0], np.cumsum(devf)])
+    cum_n = np.concatenate([[0.0], np.cumsum(valid_dev)])
+    num = cum_d[k_idx] - cum_d[lo]
+    den = cum_n[k_idx] - cum_n[lo]
+    s = np.where(den > 0, num / np.where(den > 0, den, 1.0), 0.0)
     s[0] = 0.0                                          # no history at the open
     s = np.clip(s, -clip_s, clip_s)
 
-    # v_hat[k, f] = u[f] * exp(rho**(f-k+1) * s[k]) for f >= k  (lower triangle = 0)
+    # v_hat[k, f] = exp(L_f) * exp(rho**(f-k+1) * s[k]) for f >= k  (lower triangle = 0)
     D = k_idx[None, :] - k_idx[:, None]                 # D[k, f] = f - k
     valid = D >= 0
     # exponent >= 1 only on the valid (upper-triangle) entries; clamp elsewhere so
     # r ** (neg) is never evaluated (avoids 0**neg warnings); masked out anyway.
     decay = np.where(valid, r ** np.where(valid, D + 1, 0), 0.0)
-    vhat = u[None, :] * np.exp(decay * s[:, None]) * valid
+    vhat = base[None, :] * np.exp(decay * s[:, None]) * valid
     denom = vhat.sum(axis=1)
     a = np.where(denom > 0, np.diag(vhat) / np.where(denom > 0, denom, 1.0), 0.0)
     a = np.clip(a, 0.0, 1.0)
@@ -1046,6 +1084,496 @@ def vwap_adaptive(bins: pl.DataFrame, quantity: float, *,
     fillable, cap = _fill_capacity(bins)
     last_idx = int(np.max(np.where(a > 0))) if np.any(a > 0) else (n - 1)
     sched = _carry_forward_exec(a, total_lots, fillable, cap, last_idx)
+    return pl.Series("q_requested", sched, dtype=pl.Float64)
+
+
+def _build_window_models(history: pl.DataFrame, needed: pl.DataFrame, *,
+                         window_days: int, fit_fn) -> dict:
+    """Trailing-window driver shared by the per-order volume models (lookahead-free).
+
+    For each ``(qcode, date)`` in ``needed`` it slices that qcode's previous
+    ``window_days`` trading days (the dense (date x bin) volume grid, **strictly
+    before** the date - the day itself is never in the window) and calls
+    ``fit_fn(window_vol, bintimes)``; non-``None`` results are keyed by
+    ``(qcode, date)``. Pooled at the qcode level (intraday shape is a qcode property).
+    """
+    date_col = "date" if "date" in needed.columns else DATE_COL
+    want: dict = {}
+    for qc, dt in needed.select(QCODE_COL, date_col).unique().iter_rows():
+        want.setdefault(qc, set()).add(dt)
+
+    h = (history.select(QCODE_COL, DATE_COL, BIN_TIME_COL, VOLUME_COL)
+         .filter(pl.col(QCODE_COL).is_in(list(want.keys()))))
+    daily = h.group_by(QCODE_COL, DATE_COL, BIN_TIME_COL).agg(
+        pl.col(VOLUME_COL).cast(pl.Float64).fill_null(0.0).sum().alias("vol"))
+
+    curves: dict = {}
+    for qc, want_dates in want.items():
+        d = daily.filter(pl.col(QCODE_COL) == qc)
+        if d.height == 0:
+            continue
+        piv = (d.pivot(on=BIN_TIME_COL, index=DATE_COL, values="vol",
+                       aggregate_function="sum").sort(DATE_COL))
+        dts = piv.get_column(DATE_COL).to_list()
+        bintimes = [c for c in piv.columns if c != DATE_COL]
+        vol = np.nan_to_num(piv.drop(DATE_COL).to_numpy().astype(float), nan=0.0)
+        pos_of = {dt: i for i, dt in enumerate(dts)}
+        for t in want_dates:
+            i = pos_of.get(t)
+            if i is None:
+                continue
+            w = vol[max(0, i - window_days):i, :]          # days t-window_days .. t-1
+            model = fit_fn(w, bintimes)
+            if model is not None:
+                curves[(qc, t)] = model
+    return curves
+
+
+def _fit_factor_model(window_vol: np.ndarray, bintimes: Sequence,
+                      n_factors: int) -> Optional[dict]:
+    """Fit an MLE ``n_factors``-factor model of intraday **log-volume deviations**.
+
+    ``window_vol`` is the trailing window's daily volume per bin, shape
+    ``(D_days, N_bins)`` (``0`` = no trade / missing). Per bin ``k`` we form the
+    seasonal log-mean ``L_k = mean_d log(vol_{d,k})`` over days that traded, and the
+    deviation ``M_{d,k} = log(vol_{d,k}) - L_k`` (imputed ``0`` - i.e. *at the mean*
+    - on no-trade days). The cross-sectional covariance of ``M`` is modelled as
+    ``Sigma ~ lambda lambda^T + diag(sigma_u^2)`` and fit by **maximum-likelihood
+    factor analysis** (the estimator that matches this exact structure; rotation is
+    irrelevant here - the downstream forecast ``lambda_m^T mu`` is invariant to any
+    orthogonal rotation of the factors). The loadings ``lambda`` and idiosyncratic
+    variances ``sigma_u^2`` are what :func:`vwap_factor` filters on.
+
+    Returns ``{"times", "L", "lam" (N,K), "su2" (N), "active", "n_factors"}`` aligned
+    to ``bintimes``, or ``None`` if there is too little usable history. Bins that
+    seldom trade (``< 2`` days) are marked inactive (``lam = 0``, ``su2 = NaN``).
+    """
+    from sklearn.decomposition import FactorAnalysis      # lazy: only this path needs sklearn
+
+    pos = window_vol > 0
+    cnt = pos.sum(axis=0)
+    active = cnt >= 2                                      # need >= 2 obs for a deviation
+    na = int(active.sum())
+    if na < 2 or window_vol.shape[0] < 3:                  # too few bins / days to fit
+        return None
+    logv = np.zeros_like(window_vol, dtype=float)
+    np.log(window_vol, out=logv, where=pos)               # log only where vol > 0
+    L = np.full(window_vol.shape[1], -np.inf)
+    L[active] = logv[:, active].sum(axis=0) / cnt[active]  # seasonal log-mean per active bin
+    M = np.where(pos, logv - np.where(np.isfinite(L), L, 0.0)[None, :], 0.0)[:, active]
+    K = max(1, min(int(n_factors), na, window_vol.shape[0] - 1))
+    try:
+        fa = FactorAnalysis(n_components=K, max_iter=2000, random_state=0).fit(M)
+        lam_a = fa.components_.T                           # (na, K): Cov ~ lam lam^T + diag(su2)
+        su2_a = np.maximum(fa.noise_variance_, 1e-10)
+    except Exception:
+        return None
+    N = window_vol.shape[1]
+    lam = np.zeros((N, K), dtype=float)
+    su2 = np.full(N, np.nan)
+    lam[active] = lam_a
+    su2[active] = su2_a
+    return {"times": list(bintimes), "L": L, "lam": lam, "su2": su2,
+            "active": active, "n_factors": K}
+
+
+def _fit_ols_model(window_vol: np.ndarray, bintimes: Sequence) -> Optional[dict]:
+    """Per-pair OLS sufficient stats of intraday **log-volume deviations**.
+
+    Builds ``M_{d,k} = log(vol_{d,k}) - L_k`` (mean-of-logs baseline ``L_k``, imputed
+    ``0`` on no-trade days, like :func:`_fit_factor_model`) over the window's active
+    bins, and stores just the **cross-moment matrix** ``C = M^T M`` (via ``M``) and the
+    day count ``D``. From these :func:`adaptive_volume_ols` derives, for any pair
+    ``(k, m)``, the no-intercept regression of ``M_m`` on ``M_k``::
+
+        beta_{m|k}      = C[k, m] / C[k, k]                          (= rho * sigma_m / sigma_k)
+        sigma2_{m|k}    = (C[m, m] - C[k, m]^2 / C[k, k]) / (D - 1)  (= sigma_m^2 (1 - rho^2))
+        Var(beta_{m|k}) = sigma2_{m|k} / C[k, k]
+        pred var r2     = sigma2_{m|k} + Var(beta_{m|k}) * M_k^2
+
+    Returns ``{"times", "L", "active", "M" (D, na), "D"}`` (``M`` kept rather than
+    ``C`` - smaller when ``D < N`` - and ``C`` is reformed in the strategy), or
+    ``None`` if there is too little usable history.
+    """
+    pos = window_vol > 0
+    cnt = pos.sum(axis=0)
+    active = cnt >= 2
+    na = int(active.sum())
+    D = window_vol.shape[0]
+    if na < 2 or D < 3:
+        return None
+    logv = np.zeros_like(window_vol, dtype=float)
+    np.log(window_vol, out=logv, where=pos)
+    L = np.full(window_vol.shape[1], -np.inf)
+    L[active] = logv[:, active].sum(axis=0) / cnt[active]
+    M = np.where(pos, logv - np.where(np.isfinite(L), L, 0.0)[None, :], 0.0)[:, active]
+    return {"times": list(bintimes), "L": L, "active": active, "M": M, "D": int(D)}
+
+
+def build_factor_curves(history: pl.DataFrame, needed: pl.DataFrame, *,
+                        window_days: int = 22, n_factors: int = 1) -> dict:
+    """Per-order **factor model** of intraday log-volume deviations (lookahead-free).
+
+    For every ``(qcode, date)`` order key in ``needed`` this fits an
+    ``n_factors``-factor model (see :func:`_fit_factor_model`) on **only** that
+    qcode's previous ``window_days`` trading days, **strictly before** the order
+    date (day ``t`` uses days ``t-window_days .. t-1`` - the same day is never in the
+    window). The decomposition is done **once per order** and consumed live by
+    :func:`vwap_factor`.
+
+    The profile is built at the **qcode** level (the intraday shape is a
+    qcode/exchange property), pooling that qcode's contract months' volume per
+    ``(date, bin_start_time)``.
+
+    Parameters
+    ----------
+    history : pl.DataFrame
+        Full bin history (``qcode``, ``publication_date``, ``bin_start_time``,
+        ``volume``).
+    needed : pl.DataFrame
+        Order keys to emit models for; needs ``qcode`` and a date column
+        (``date`` or ``publication_date``).
+    window_days : int, default 22
+        Trailing trading-day window (per qcode), excluding the order day.
+    n_factors : int, default 1
+        Number of latent factors ``K`` (the parameter to vary in the notebook). The
+        actual ``K`` is capped at the usable bin/day count per order.
+
+    Returns
+    -------
+    dict
+        ``{(qcode, date): factor_model_dict}`` for keys with enough prior history;
+        keys without it are omitted, so :func:`vwap_factor` falls back to TWAP.
+    """
+    return _build_window_models(history, needed, window_days=window_days,
+                                fit_fn=lambda w, bt: _fit_factor_model(w, bt, n_factors))
+
+
+def build_ols_curves(history: pl.DataFrame, needed: pl.DataFrame, *,
+                     window_days: int = 22) -> dict:
+    """Per-order **pairwise-OLS** model of intraday log-volume deviations (lookahead-free).
+
+    For every ``(qcode, date)`` order key in ``needed`` this stores the cross-moment
+    sufficient statistics (see :func:`_fit_ols_model`) of the deseasonalised
+    log-volume deviations over **only** that qcode's previous ``window_days`` trading
+    days, strictly before the order date. :func:`adaptive_volume_ols` then forms, at
+    each step, the backward regression of every future bin ``m`` on the most recent
+    observed bin ``k`` and forecasts ``M_m | M_k`` (the Markov / "Option A" form).
+
+    Parameters
+    ----------
+    history : pl.DataFrame
+        Full bin history (``qcode``, ``publication_date``, ``bin_start_time``,
+        ``volume``).
+    needed : pl.DataFrame
+        Order keys to emit models for; needs ``qcode`` and a date column.
+    window_days : int, default 22
+        Trailing trading-day window (per qcode), excluding the order day.
+
+    Returns
+    -------
+    dict
+        ``{(qcode, date): ols_model_dict}`` for keys with enough prior history; keys
+        without it are omitted, so :func:`adaptive_volume_ols` falls back to TWAP.
+    """
+    return _build_window_models(history, needed, window_days=window_days,
+                                fit_fn=_fit_ols_model)
+
+
+def certainty_equivalent_volume(v_hat: object, log_var: object, *,
+                                coef: float = 0.25) -> np.ndarray:
+    r"""Confidence-adjust a volume forecast by its **log-volume forecast variance**.
+
+    Under square-root market impact the execution cost is convex in volume
+    (``cost ~ V^{-1/2}``), so feeding a *point* volume forecast into a schedule is
+    optimistic - a bin whose volume is uncertain should be trusted less. Taking the
+    expectation over a log-normal volume ``V = exp(m + r * eps)`` and matching the
+    certainty-equivalent ``E[V^{-1/2}]`` gives::
+
+        V_tilde_k = V_hat_k * exp(-coef * r_k^2),     coef = 1/4
+
+    where ``V_hat_k = exp(m_k)`` is the point (median) forecast and ``r_k^2`` is the
+    forecast **variance of log-volume** for bin ``k``. ``coef = 1/4`` is exact for the
+    ``V^{-1/2}`` cost here (derived from the log-normal MGF ``E[V^{-1/2}] =
+    exp(-m/2 + r^2/8)``); it is exposed for other impact curves. High certainty
+    (``r_k^2 -> 0``) leaves the forecast unchanged; high uncertainty shrinks it.
+
+    Reusable across any model that produces a per-bin log-volume forecast variance
+    (e.g. :func:`vwap_factor`, where ``r_k^2`` is the predictive diagonal
+    ``lambda_k^T P lambda_k + sigma_{u,k}^2``).
+
+    Parameters
+    ----------
+    v_hat : array-like
+        Point volume forecast(s) ``V_hat_k`` (``>= 0``).
+    log_var : array-like
+        Forecast variance of **log**-volume ``r_k^2`` (``>= 0``), same shape.
+    coef : float, default 0.25
+        Penalty coefficient (``1/4`` for square-root impact).
+
+    Returns
+    -------
+    np.ndarray
+        Penalised ("certainty-equivalent") volume ``V_tilde_k``.
+
+    Examples
+    --------
+    >>> round(float(certainty_equivalent_volume(100.0, 0.0)), 6)    # no uncertainty
+    100.0
+    >>> round(float(certainty_equivalent_volume(100.0, 4.0)), 6)    # 100 * exp(-1)
+    36.787944
+    """
+    return np.asarray(v_hat, dtype=float) * np.exp(-coef * np.asarray(log_var, dtype=float))
+
+
+def vwap_factor(bins: pl.DataFrame, quantity: float, *,
+                curves: dict, ce_adjust: bool = True, **_: object) -> pl.Series:
+    """Dynamic K-factor VWAP via a sequential Kalman update on log-volume surprises.
+
+    Treats the day's latent volume **factor(s)** ``F`` as a state with a
+    standard-normal prior and sequentially updates the belief ``(mu, P)`` as each
+    bin's volume is realised, then re-forecasts the *remaining* bins and participates
+    in proportion to the forecast - the factor-model analogue of
+    :func:`vwap_adaptive` (which uses a single AR(1) surprise). The loadings
+    ``lambda_k`` and idiosyncratic variances ``sigma_{u,k}^2`` come from
+    :func:`build_factor_curves` (trailing ``window_days``, lookahead-free).
+
+    With per-bin log-volume deviation ``M_k = log(vol_k) - L_k``, at the start of bin
+    ``k`` the belief reflects bins ``< k`` only (causal). For each just-completed bin
+    the standard measurement update is applied (``H = lambda_k``, ``R =
+    sigma_{u,k}^2``)::
+
+        y_k = M_k - lambda_k . mu                 # surprise
+        S_k = lambda_k . P lambda_k + sigma_u^2   # innovation variance (scalar)
+        Kg  = P lambda_k / S_k                    # Kalman gain (K-vector)
+        mu  = mu + Kg * y_k
+        P   = (I - Kg lambda_k^T) P
+
+    The remaining bins are forecast as ``vol_hat_m = exp(L_m + lambda_m . mu)`` and
+    (when ``ce_adjust``) **confidence-adjusted** by their predictive log-volume
+    variance via :func:`certainty_equivalent_volume`::
+
+        r_m^2       = lambda_m^T P lambda_m + sigma_{u,m}^2    # predictive log-var (current P)
+        vol_tilde_m = vol_hat_m * exp(-r_m^2 / 4)             # certainty-equivalent volume
+
+    so bins whose volume is less certain are trusted less (square-root impact makes
+    cost convex in volume). The factor-uncertainty term ``lambda_m^T P lambda_m``
+    shrinks as bins are observed (``P`` falls), so the penalty relaxes through the
+    day. Bin ``k`` then requests its share ``vol_tilde_k / sum_{m>=k} vol_tilde_m``
+    of the lots **still to fill**. For ``K = 1`` the update is exactly the scalar
+    spec; for ``K > 1`` the forecast is invariant to factor rotation, so no rotation
+    handling is needed.
+
+    This is a **dynamic** strategy: it **carries forward** unfilled lots (``remaining``
+    is decremented by the actual fill, an unfilled slice rolls into later bins, and
+    the last active bin sweeps up the residual). Whole lots throughout; strictly
+    causal (bin ``k`` uses only volume ``< k``). Falls back to :func:`twap_schedule`
+    when no factor model exists for the (qcode, date) or nothing is tradeable.
+
+    Parameters
+    ----------
+    bins : pl.DataFrame
+        Bins for one (security, date) with ``qcode``, ``publication_date``,
+        ``bin_start_time`` and ``volume``. Time-sorted by the caller.
+    quantity : float
+        Total lots (rounded to whole lots).
+    curves : dict
+        ``{(qcode, date): factor_model}`` from :func:`build_factor_curves`, via
+        ``strategy_params``. The number of factors is fixed at build time.
+    ce_adjust : bool, default True
+        Apply the certainty-equivalent volume penalty ``exp(-r_m^2 / 4)`` (see
+        :func:`certainty_equivalent_volume`) before forming the schedule. ``False``
+        allocates on the raw point forecast.
+
+    Returns
+    -------
+    pl.Series
+        Integer-valued float series of length ``len(bins)``; whole lots, with
+        unfilled lots carried forward (requested total ``>= round(quantity)``).
+    """
+    n = bins.height
+    if n == 0:
+        return pl.Series("q_requested", [], dtype=pl.Float64)
+    total_lots = int(round(float(quantity)))
+    if total_lots <= 0:
+        return pl.Series("q_requested", [0.0] * n, dtype=pl.Float64)
+
+    model = None
+    if QCODE_COL in bins.columns and DATE_COL in bins.columns:
+        model = curves.get((bins.get_column(QCODE_COL)[0], bins.get_column(DATE_COL)[0]))
+    if model is None:
+        return twap_schedule(bins, total_lots)
+
+    idx = {t: j for j, t in enumerate(model["times"])}
+    sel = [idx.get(t, -1) for t in bins.get_column(BIN_TIME_COL).to_list()]
+    Kf = int(model["n_factors"])
+    L = np.array([model["L"][j] if j >= 0 else -np.inf for j in sel], dtype=float)
+    lam = np.array([model["lam"][j] if j >= 0 else np.zeros(Kf) for j in sel], dtype=float)
+    su2 = np.array([model["su2"][j] if j >= 0 else np.nan for j in sel], dtype=float)
+    active = np.isfinite(su2) & (su2 > 0) & np.isfinite(L)
+    if not active.any():
+        return twap_schedule(bins, total_lots)
+
+    base = np.where(active, np.exp(np.clip(L, -50.0, 50.0)), 0.0)   # seasonal volume exp(L_k)
+    vr = (bins.get_column(VOLUME_COL).cast(pl.Float64)
+          .fill_null(0.0).fill_nan(0.0).to_numpy())
+    fillable, cap = _fill_capacity(bins)
+    last_idx = int(np.max(np.where(active)))
+
+    mu = np.zeros(Kf)
+    P = np.eye(Kf)
+    sched = np.zeros(n, dtype=float)
+    remaining = float(total_lots)
+    for k in range(n):
+        # sequential measurement update with the just-completed bin (k-1): causal
+        if k >= 1 and active[k - 1] and vr[k - 1] > 0:
+            y = (math.log(vr[k - 1]) - L[k - 1]) - float(lam[k - 1] @ mu)
+            Pl = P @ lam[k - 1]
+            S = float(lam[k - 1] @ Pl + su2[k - 1])
+            if S > 0:
+                Kg = Pl / S
+                mu = mu + Kg * y
+                P = P - np.outer(Kg, Pl)
+        if remaining <= 0.5:
+            break
+        if k == last_idx:
+            q = remaining                                  # sweep up the residual
+        elif not active[k]:
+            q = 0.0
+        else:
+            vhat = base * np.exp(np.clip(lam @ mu, -50.0, 50.0))   # point volume forecast
+            if ce_adjust:
+                # certainty-equivalent penalty using the PREDICTIVE log-volume
+                # variance r2 = lam_m^T P lam_m + su2 (current P -> shrinks over the day)
+                r2 = ((lam @ P) * lam).sum(axis=1) + np.nan_to_num(su2, nan=0.0)
+                vhat = certainty_equivalent_volume(vhat, r2)
+            fcast = np.where(active, vhat, 0.0)
+            denom = float(fcast[k:].sum())
+            w = fcast[k] / denom if denom > 0 else 0.0
+            q = min(float(round(w * remaining)), remaining)
+        sched[k] = q
+        if fillable[k]:
+            remaining -= min(q, cap[k])
+    return pl.Series("q_requested", sched, dtype=pl.Float64)
+
+
+def adaptive_volume_ols(bins: pl.DataFrame, quantity: float, *,
+                        curves: dict, ce_adjust: bool = True, **_: object) -> pl.Series:
+    """Dynamic VWAP via per-pair **OLS** forecasts of log-volume (Markov / Option A).
+
+    A lighter-weight cousin of :func:`vwap_factor`: instead of a factor Kalman filter
+    it uses, for each future bin ``m``, the **backward linear regression** of ``M_m``
+    on the most recently observed bin's deviation ``M_k`` (the Markov assumption
+    ``M_m | M_1..M_k = M_m | M_k``), estimated on the trailing window by
+    :func:`build_ols_curves`. With cross-moments ``C = M^T M`` and ``D`` window days::
+
+        beta_{m|k}   = C[k, m] / C[k, k]                            # = rho * sigma_m/sigma_k
+        sigma2_{m|k} = (C[m, m] - C[k, m]^2 / C[k, k]) / (D - 1)    # = sigma_m^2 (1 - rho^2)
+        M_m | M_k ~ N( beta_{m|k} M_k ,  sigma2_{m|k} + (sigma2_{m|k}/C[k,k]) * M_k^2 )
+
+    The prediction variance ``r2`` adds the slope-estimation term
+    ``Var(beta) * M_k^2`` (so a large/extrapolated surprise is trusted less). Each
+    remaining bin is forecast ``vol_hat_m = exp(L_m + beta_{m|k} M_k)``, then (when
+    ``ce_adjust``) shrunk by the convexity penalty
+    ``vol_tilde_m = vol_hat_m * exp(-r2_m / 4)`` via
+    :func:`certainty_equivalent_volume`, and the schedule participates in proportion
+    to ``vol_tilde`` over the lots **still to fill**.
+
+    Conditions on the **latest completed traded bin** (re-planned every bin), so it is
+    strictly causal; before any bin has traded it uses the unconditional baseline
+    (``M_hat = 0``, ``r2 = sigma_m^2``). **Dynamic** strategy - carries forward unfilled
+    lots, whole lots throughout. Falls back to :func:`twap_schedule` when there is no
+    OLS model for the (qcode, date) or nothing is tradeable.
+
+    Parameters
+    ----------
+    bins : pl.DataFrame
+        Bins for one (security, date) with ``qcode``, ``publication_date``,
+        ``bin_start_time`` and ``volume``. Time-sorted by the caller.
+    quantity : float
+        Total lots (rounded to whole lots).
+    curves : dict
+        ``{(qcode, date): ols_model}`` from :func:`build_ols_curves`, via
+        ``strategy_params``.
+    ce_adjust : bool, default True
+        Apply the certainty-equivalent volume penalty ``exp(-r2_m / 4)`` before
+        scheduling (see :func:`certainty_equivalent_volume`).
+
+    Returns
+    -------
+    pl.Series
+        Integer-valued float series of length ``len(bins)``; whole lots, unfilled
+        lots carried forward.
+    """
+    n = bins.height
+    if n == 0:
+        return pl.Series("q_requested", [], dtype=pl.Float64)
+    total_lots = int(round(float(quantity)))
+    if total_lots <= 0:
+        return pl.Series("q_requested", [0.0] * n, dtype=pl.Float64)
+
+    model = None
+    if QCODE_COL in bins.columns and DATE_COL in bins.columns:
+        model = curves.get((bins.get_column(QCODE_COL)[0], bins.get_column(DATE_COL)[0]))
+    if model is None:
+        return twap_schedule(bins, total_lots)
+
+    C = model["M"].T @ model["M"]                          # (na, na) cross-moments M^T M
+    diagC = np.diag(C).copy()
+    D = int(model["D"])
+    active_full = np.where(model["active"])[0]             # model-bin indices, in C-column order
+    Lc = model["L"][active_full]                           # mean-of-log baseline per C column
+    colpos = {int(fi): a for a, fi in enumerate(active_full)}
+
+    idx = {t: j for j, t in enumerate(model["times"])}
+    sel = [idx.get(t, -1) for t in bins.get_column(BIN_TIME_COL).to_list()]
+    L = np.array([model["L"][j] if j >= 0 else -np.inf for j in sel], dtype=float)
+    col = np.array([colpos.get(j, -1) if j >= 0 else -1 for j in sel], dtype=int)  # day-bin -> C column
+    active = (col >= 0) & np.isfinite(L)
+    if not active.any():
+        return twap_schedule(bins, total_lots)
+
+    vr = (bins.get_column(VOLUME_COL).cast(pl.Float64)
+          .fill_null(0.0).fill_nan(0.0).to_numpy())
+    fillable, cap = _fill_capacity(bins)
+    last_idx = int(np.max(np.where(active)))
+
+    sched = np.zeros(n, dtype=float)
+    remaining = float(total_lots)
+    j_col = -1                                             # C-column of the latest traded bin
+    m_obs = 0.0                                            # its realised deviation M_k
+    for k in range(n):
+        # condition on the just-completed bin (k-1): causal Markov update
+        if k >= 1 and active[k - 1] and vr[k - 1] > 0:
+            j_col = int(col[k - 1])
+            m_obs = math.log(vr[k - 1]) - L[k - 1]
+        if remaining <= 0.5:
+            break
+        if k == last_idx:
+            q = remaining
+        elif not active[k]:
+            q = 0.0
+        else:
+            if j_col >= 0 and diagC[j_col] > 0:
+                ck = diagC[j_col]
+                beta = C[j_col, :] / ck                    # (na,)
+                mhat = beta * m_obs
+                sigma2 = np.maximum(diagC - C[j_col, :] ** 2 / ck, 0.0) / max(D - 1, 1)
+                r2 = sigma2 + (sigma2 / ck) * m_obs ** 2
+            else:                                          # no observation yet -> unconditional
+                mhat = np.zeros(C.shape[0])
+                r2 = diagC / max(D - 1, 1)
+            vt = np.exp(np.clip(Lc + mhat, -50.0, 50.0))   # vol_hat_m = exp(L_m + beta*M_k)
+            if ce_adjust:
+                vt = certainty_equivalent_volume(vt, r2)
+            fcast = np.zeros(n)
+            fcast[active] = vt[col[active]]
+            denom = float(fcast[k:].sum())
+            w = fcast[k] / denom if denom > 0 else 0.0
+            q = min(float(round(w * remaining)), remaining)
+        sched[k] = q
+        if fillable[k]:
+            remaining -= min(q, cap[k])
     return pl.Series("q_requested", sched, dtype=pl.Float64)
 
 
@@ -1819,14 +2347,16 @@ def decompose_is_stats(summary: pl.DataFrame,
     return pl.DataFrame(recs)
 
 
-def asset_impact(summary: pl.DataFrame) -> pl.DataFrame:
-    """Per-asset (qcode) **order-impact** metric, notional-weighted across orders.
+def asset_impact(summary: pl.DataFrame, *, by: str = "qcode") -> pl.DataFrame:
+    """Grouped **order-impact** metric, notional-weighted across orders.
 
     The "market-impact implementation shortfall": realised spread cost on the
     filled lots **plus** a cross-the-spread opportunity cost on the unfilled
-    shortfall, with **no drift term** (unlike :func:`decompose_is`). For each
-    ``qcode`` it sums the per-order pieces from :func:`summarise_fills` over that
-    qcode's orders and forms notional-weighted bps::
+    shortfall, with **no drift term** (unlike :func:`decompose_is`). Within each
+    group (``by``, default per ``qcode``; pass e.g. ``"asset_class"`` to pool by
+    asset class) it **sums the dollar pieces** from :func:`summarise_fills` and
+    divides once - a genuine notional-weighted ratio, **not** an average of the
+    per-qcode bps::
 
         realised_$       = Sum_orders Sum_bins  x * s * q_filled        (= total_realised_impact)
         opportunity_$    = Sum_orders  CROSS_SPREAD_FRACTION * s_last * q_unfilled
@@ -1842,13 +2372,17 @@ def asset_impact(summary: pl.DataFrame) -> pl.DataFrame:
     Parameters
     ----------
     summary : pl.DataFrame
-        Output of :func:`summarise_fills` (needs ``qcode``, ``total_realised_impact``,
-        ``opportunity_impact``, ``impact_notional``, ``fill_rate``).
+        Output of :func:`summarise_fills` (needs ``total_realised_impact``,
+        ``opportunity_impact``, ``impact_notional``, ``fill_rate`` and the ``by``
+        column).
+    by : str, default ``"qcode"``
+        Grouping column - ``"qcode"`` for per-asset, ``"asset_class"`` (after a join)
+        to pool bond / commodity / equity futures, etc.
 
     Returns
     -------
     pl.DataFrame
-        One row per ``qcode`` with ``n_orders``, ``fill_rate`` (mean), the three
+        One row per ``by`` group with ``n_orders``, ``fill_rate`` (mean), the three
         ``*_$`` totals, ``impact_notional`` and ``realised_bps`` /
         ``opportunity_bps`` / ``total_impact_bps``.
     """
@@ -1857,7 +2391,7 @@ def asset_impact(summary: pl.DataFrame) -> pl.DataFrame:
         & pl.col("impact_notional").is_not_nan()
         & (pl.col("impact_notional") > 0)
     )
-    g = s.group_by("qcode", maintain_order=True).agg(
+    g = s.group_by(by, maintain_order=True).agg(
         n_orders=pl.len(),
         fill_rate=pl.col("fill_rate").mean(),
         realised_impact=pl.col("total_realised_impact").sum(),
