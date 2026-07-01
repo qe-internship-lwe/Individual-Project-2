@@ -2347,8 +2347,126 @@ def decompose_is_stats(summary: pl.DataFrame,
     return pl.DataFrame(recs)
 
 
+# monetary (native-currency) columns of a summarise_fills row that must be scaled
+# TOGETHER by the same FX rate so their ratios (the bps metrics) stay invariant while
+# their cross-asset SUMS become currency-consistent. Deliberately excludes the IS
+# columns (is_currency / total_cost) and the per-unit prices - the order-impact family
+# is what asset_impact / order_impact_stats pool across assets.
+_USD_MONETARY_COLS = ("total_realised_impact", "opportunity_impact",
+                      "impact_notional", "order_impact")
+
+
+def apply_multiplier(summary: pl.DataFrame, multipliers: pl.DataFrame, *,
+                     monetary_cols: Sequence[str] = _USD_MONETARY_COLS,
+                     qcode_col: str = "qcode", mult_col: str = "mult") -> pl.DataFrame:
+    """Scale an order summary's ``$`` columns by the per-contract **contract multiplier**.
+
+    The fill model works in **quote points x contract counts**, so the raw ``$``
+    columns from :func:`summarise_fills` (``total_realised_impact``,
+    ``impact_notional``, ...) are in *point-contracts*, not real currency. Multiplying
+    by the contract multiplier (currency per point per contract - e.g. ES = ``$50`` /
+    point, a bond future = ``1000``) turns them into genuine native-currency notional.
+
+    Like :func:`to_usd` this is a per-order **constant** scale (one multiplier per
+    ``qcode``), so every ratio built from these columns - per-order and per-``qcode``
+    bps, the paired t-tests - is unchanged. Only cross-asset ``$`` sums shift: a
+    high-multiplier contract now contributes proportionally more notional to a pooled
+    group. Apply this **before** :func:`to_usd` (points -> native currency -> USD).
+
+    Parameters
+    ----------
+    summary : pl.DataFrame
+        Output of :func:`summarise_fills` (needs ``qcode_col``).
+    multipliers : pl.DataFrame
+        ``qcode -> mult`` lookup (e.g. ``contract_multipliers.csv``); must contain
+        ``qcode_col`` and ``mult_col``.
+    monetary_cols : sequence of str, default the order-impact ``$`` family
+        Columns to scale. Missing columns are skipped.
+    qcode_col, mult_col : str
+        Column names for the join key and the multiplier value.
+
+    Returns
+    -------
+    pl.DataFrame
+        ``summary`` with the ``monetary_cols`` scaled to native-currency notional.
+    """
+    mm = multipliers.select(pl.col(qcode_col), pl.col(mult_col).cast(pl.Float64).alias("_mult"))
+    s = (summary.join(mm, on=qcode_col, how="left")
+                .with_columns(pl.col("_mult").fill_null(1.0)))
+    s = s.with_columns([(pl.col(c) * pl.col("_mult")).alias(c)
+                        for c in monetary_cols if c in s.columns])
+    return s.drop("_mult")
+
+
+def to_usd(summary: pl.DataFrame, fx: pl.DataFrame, ccy_map: pl.DataFrame, *,
+           monetary_cols: Sequence[str] = _USD_MONETARY_COLS,
+           date_col: str = "date", qcode_col: str = "qcode") -> pl.DataFrame:
+    """Convert an order summary's native-currency ``$`` columns to USD.
+
+    The dataset spans several quote currencies (see ``docs/qcode_mapping.md``), so any
+    metric that **sums** ``$`` across instruments - :func:`asset_impact` pooled by tier
+    / asset class, the ``*_bps_nw`` and ``$`` columns of :func:`order_impact_stats` -
+    is meaningless until the pieces share a currency. This joins each order's quote
+    currency (``ccy_map``: ``qcode -> currency``) and the daily FX rate (``fx``:
+    columns ``currency``, ``date``, ``usd_per_unit``) and multiplies every column in
+    ``monetary_cols`` by ``usd_per_unit`` (USD instruments pass through at 1.0). The FX
+    match is an **as-of backward** join on ``date`` within currency, so weekends /
+    holidays take the most recent prior rate.
+
+    Because all ``monetary_cols`` are scaled by the **same** per-order factor, every
+    ratio built from them (per-order and per-qcode bps, the paired t-tests) is
+    unchanged - only the cross-asset sums are corrected. Run this on each summary
+    **before** any grouped/pooled aggregation.
+
+    Parameters
+    ----------
+    summary : pl.DataFrame
+        Output of :func:`summarise_fills` (needs ``qcode_col`` and ``date_col``).
+    fx : pl.DataFrame
+        Daily FX table with columns ``currency``, ``date`` and ``usd_per_unit`` (USD
+        per one unit of the local currency). USD need not be present - it passes
+        through at 1.0.
+    ccy_map : pl.DataFrame
+        ``qcode -> currency`` lookup (e.g. ``qcode_mapping.csv``); must contain
+        ``qcode`` and ``currency``.
+    monetary_cols : sequence of str, default the order-impact ``$`` family
+        Columns to convert (scaled together). Missing columns are skipped.
+    date_col, qcode_col : str
+        Column names in ``summary``.
+
+    Returns
+    -------
+    pl.DataFrame
+        ``summary`` with the ``monetary_cols`` expressed in USD and an added
+        ``currency`` column. Row order is not preserved (sorted for the as-of join).
+    """
+    fx2 = (fx.select("currency",
+                     pl.col(date_col if date_col in fx.columns else "date")
+                     .cast(pl.Utf8).alias("_fxdate"),
+                     pl.col("usd_per_unit").cast(pl.Float64))
+             .sort(["currency", "_fxdate"]))
+    ccy = ccy_map.select(pl.col("qcode").alias(qcode_col), "currency")
+    s = (summary.join(ccy, on=qcode_col, how="left")
+                .with_columns(pl.col("currency").fill_null("USD"),
+                              pl.col(date_col).cast(pl.Utf8).alias("_sdate"))
+                .sort(["currency", "_sdate"]))
+    s = s.join_asof(fx2, left_on="_sdate", right_on="_fxdate", by="currency",
+                    strategy="backward", check_sortedness=False)
+    # USD (never in fx) and any pre-history gap fall back to 1.0
+    s = s.with_columns(pl.col("usd_per_unit").fill_null(1.0))
+    s = s.with_columns([(pl.col(c) * pl.col("usd_per_unit")).alias(c)
+                        for c in monetary_cols if c in s.columns])
+    return s.drop(["_sdate", "_fxdate", "usd_per_unit"], strict=False)
+
+
 def asset_impact(summary: pl.DataFrame, *, by: str = "qcode") -> pl.DataFrame:
     """Grouped **order-impact** metric, notional-weighted across orders.
+
+    .. warning::
+        The ``$`` pieces are **summed** within each group, so ``summary`` must be in a
+        **single currency** for any group that spans instruments. Grouping by ``qcode``
+        is always safe (one currency per qcode); for ``by="tier"`` / ``"asset_class"``
+        run :func:`to_usd` on the summary first, or the pooled bps mixes currencies.
 
     The "market-impact implementation shortfall": realised spread cost on the
     filled lots **plus** a cross-the-spread opportunity cost on the unfilled
@@ -2588,3 +2706,217 @@ def participation_stats(disp: pl.DataFrame,
     if label is not None:
         rec = {"strategy": label, **rec}
     return pl.DataFrame([rec])
+
+
+# ---------------------------------------------------------------------------
+# Pairwise significance tests (paired t-tests, one matrix per group)
+# ---------------------------------------------------------------------------
+
+# per-order impact-bps numerator (divided by impact_notional * 1e4) for each metric;
+# mirrors the METRIC options of :func:`asset_impact` / the notebook tier tables.
+_IMPACT_NUMERATOR = {
+    "total_impact_bps": "order_impact",
+    "realised_bps": "total_realised_impact",
+    "opportunity_bps": "opportunity_impact",
+}
+
+
+def _tier_lookup(tiers: dict) -> pl.DataFrame:
+    """Long-form ``qcode -> _group`` lookup from a ``{group_label: [qcodes]}`` map."""
+    return pl.DataFrame({
+        "qcode": [q for qs in tiers.values() for q in qs],
+        "_group": [g for g, qs in tiers.items() for _ in qs],
+    })
+
+
+def paired_ttest_panels(by_strat: dict, strats: Sequence[str], groups: Sequence,
+                        *, title: str = "", value_label: str = "value",
+                        ncol: int = 2, show: bool = True):
+    """Grid of per-group ``N x N`` paired-t-test matrices comparing strategies pairwise.
+
+    For each ``group`` and each ordered strategy pair ``(i, j)``, the orders present in
+    **both** strategies (matched on ``order_id``) are paired and a paired t-test
+    (``scipy.stats.ttest_rel``) is run on the per-order ``val`` - H0: the mean pairwise
+    difference is zero. ``t > 0`` means strategy ``i``'s metric is higher than strategy
+    ``j``'s. Every matrix cell is coloured by the p-value (green ``p<0.01``, orange
+    ``0.01<=p<0.05``, grey = not significant) and annotated with ``t``, ``p`` and the
+    paired sample size ``n``; the diagonal is blank. ``matplotlib`` and ``scipy`` are
+    imported lazily, so they are only required when this function is actually called.
+
+    Parameters
+    ----------
+    by_strat : dict[str, pl.DataFrame]
+        ``{strategy_name -> frame}`` where each frame has columns ``order_id``,
+        ``_group`` (the panel key) and ``val`` (the per-order metric under test).
+    strats : sequence of str
+        Strategy names, in the row/column order of every matrix. ``N = len(strats)`` is
+        read here, never hardcoded, so extra strategies just enlarge the grid.
+    groups : sequence
+        Panel keys to draw - one ``N x N`` matrix each (e.g. the impact tiers).
+    title : str, optional
+        Figure suptitle.
+    value_label : str, optional
+        Name of the per-order metric, used in the x-axis caption.
+    ncol : int, default 2
+        Number of panel columns in the subplot grid.
+    show : bool, default True
+        Call ``plt.show()`` when done (notebook convenience).
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import ListedColormap, BoundaryNorm
+    from matplotlib.patches import Patch
+    from scipy import stats
+
+    strats = list(strats)
+    groups = list(groups)
+    N = len(strats)
+    cmap = ListedColormap(["#d9d9d9", "#fdae61", "#1a9850"])   # n.s. / p<0.05 / p<0.01
+    norm = BoundaryNorm([-0.5, 0.5, 1.5, 2.5], cmap.N)
+    nrow = int(np.ceil(len(groups) / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(1.25 * N * ncol, 1.15 * N * nrow),
+                             squeeze=False)
+    axes = axes.reshape(-1)
+    for ax, grp in zip(axes, groups):
+        # per-strategy {order_id -> val} restricted to this group
+        cols = {}
+        for nm in strats:
+            d = by_strat[nm].filter(pl.col("_group") == grp)
+            cols[nm] = dict(zip(d["order_id"].to_list(), d["val"].to_list()))
+        tvals = np.full((N, N), np.nan)
+        pvals = np.full((N, N), np.nan)
+        code = np.full((N, N), np.nan)
+        nobs = np.zeros((N, N), int)
+        for i, a in enumerate(strats):
+            for j, b in enumerate(strats):
+                if i == j:
+                    continue
+                ca, cb = cols[a], cols[b]
+                keys = ca.keys() & cb.keys()
+                xa = np.fromiter((ca[k] for k in keys), float, len(keys))
+                xb = np.fromiter((cb[k] for k in keys), float, len(keys))
+                m = np.isfinite(xa) & np.isfinite(xb)
+                xa, xb = xa[m], xb[m]
+                nobs[i, j] = xa.size
+                if xa.size < 2 or np.allclose(xa, xb):
+                    continue
+                t, p = stats.ttest_rel(xa, xb)
+                if not np.isfinite(t):
+                    continue
+                tvals[i, j], pvals[i, j] = t, p
+                code[i, j] = 2 if p < 0.01 else (1 if p < 0.05 else 0)
+        ax.imshow(np.ma.masked_invalid(code), cmap=cmap, norm=norm, aspect="equal")
+        ax.set_xticks(range(N)); ax.set_yticks(range(N))
+        ax.set_xticklabels(strats, rotation=45, ha="right", fontsize=6)
+        ax.set_yticklabels(strats, fontsize=6)
+        ax.set_title(f"{grp}", fontsize=9)
+        for i in range(N):
+            for j in range(N):
+                if i == j:
+                    ax.text(j, i, "--", ha="center", va="center", fontsize=7, color="grey")
+                elif np.isfinite(tvals[i, j]):
+                    ax.text(j, i, f"t={tvals[i, j]:.2f}\np={pvals[i, j]:.2g}\nn={nobs[i, j]}",
+                            ha="center", va="center", fontsize=5.0)
+                else:
+                    ax.text(j, i, "n/a", ha="center", va="center", fontsize=5.5, color="grey")
+    for ax in axes[len(groups):]:
+        ax.set_visible(False)
+    handles = [Patch(color="#1a9850", label="p < 0.01"),
+               Patch(color="#fdae61", label="0.01 <= p < 0.05"),
+               Patch(color="#d9d9d9", label="p >= 0.05  (not significant)")]
+    fig.suptitle(title, fontsize=12, y=0.995)
+    fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0.955),
+               ncol=3, fontsize=9, framealpha=0.9)
+    fig.supxlabel(f"strategy B (columns) -- entry (row i, col j): paired t-test of "
+                  f"{value_label}; t>0 => row i higher than col j", fontsize=9)
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
+    if show:
+        plt.show()
+    return fig
+
+
+def paired_impact_ttest(summaries: Sequence, tiers: dict, *, bucket: str = "",
+                        metric: str = "total_impact_bps", show: bool = True):
+    """Pairwise paired t-tests of the per-order market-impact bps, one matrix per tier.
+
+    Thin wrapper over :func:`paired_ttest_panels`. For each strategy the per-order
+    impact bps is ``<numerator> / impact_notional * 1e4`` over the valid orders
+    (positive ``impact_notional``); ``metric`` picks the numerator
+    (``total_impact_bps`` -> ``order_impact``; ``realised_bps`` ->
+    ``total_realised_impact``; ``opportunity_bps`` -> ``opportunity_impact``). This is
+    the **per-order** analogue of the pooled, notional-weighted tier bps from
+    :func:`asset_impact` - the pooled figure is one number per tier and so cannot be
+    paired, hence the per-order ratio is tested instead.
+
+    Parameters
+    ----------
+    summaries : sequence of (str, pl.DataFrame)
+        ``(strategy_name, summarise_fills output)`` pairs; all strategies must share the
+        ``order_id`` space (i.e. be run from the same trade list).
+    tiers : dict[str, sequence[str]]
+        ``{tier_label: [qcodes]}`` mapping (e.g. the notebook's ``IMPACT_TIERS``).
+    bucket : str, optional
+        Trade-list label, shown in the title.
+    metric : str, default ``"total_impact_bps"``
+        Which impact component to test (see above).
+    show : bool, default True
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    num = _IMPACT_NUMERATOR[metric]
+    lut = _tier_lookup(tiers)
+    by_strat = {
+        nm: (s.filter(pl.col("impact_notional").is_not_null()
+                      & pl.col("impact_notional").is_not_nan()
+                      & (pl.col("impact_notional") > 0))
+              .join(lut, on="qcode", how="inner")
+              .select("order_id", "_group",
+                      (pl.col(num) / pl.col("impact_notional") * 1e4).alias("val")))
+        for nm, s in summaries
+    }
+    return paired_ttest_panels(
+        by_strat, [nm for nm, _ in summaries], list(tiers.keys()),
+        title=f"Paired t-test: per-order {metric}, strategy x strategy by tier - {bucket}",
+        value_label=metric, show=show)
+
+
+def paired_participation_ttest(fills: Sequence, tiers: dict, *, bucket: str = "",
+                               show: bool = True):
+    """Pairwise paired t-tests of the per-order participation CV, one matrix per tier.
+
+    Thin wrapper over :func:`paired_ttest_panels`. For each strategy the per-order
+    metric is the participation CV from :func:`participation_dispersion` (orders with an
+    undefined CV dropped), tagged with its ``tiers`` bucket and paired across strategies
+    on ``order_id``.
+
+    Parameters
+    ----------
+    fills : sequence of (str, pl.DataFrame)
+        ``(strategy_name, per-bin fills)`` pairs (the ``*_fills_full`` frames).
+    tiers : dict[str, sequence[str]]
+        ``{tier_label: [qcodes]}`` mapping.
+    bucket : str, optional
+    show : bool, default True
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    lut = _tier_lookup(tiers)
+    by_strat = {
+        nm: (participation_dispersion(f)
+             .filter(pl.col("participation_cv").is_not_null()
+                     & pl.col("participation_cv").is_not_nan())
+             .join(lut, on="qcode", how="inner")
+             .select("order_id", "_group", pl.col("participation_cv").alias("val")))
+        for nm, f in fills
+    }
+    return paired_ttest_panels(
+        by_strat, [nm for nm, _ in fills], list(tiers.keys()),
+        title=f"Paired t-test: per-order participation CV, strategy x strategy by tier - {bucket}",
+        value_label="participation CV", show=show)

@@ -368,6 +368,26 @@ summary — `$` totals plus bps both **averaged across assets** (`realised_bps` 
 `$` totals). The two can differ markedly when opportunity concentrates in
 illiquid, low-fill names.
 
+> **Units — read before pooling `$` across assets.** The raw `$` columns from
+> `summarise_fills` are in **quote-point × contract** units *and* in each instrument's
+> **native currency** — and the universe spans 50 contracts with different multipliers
+> and 7 quote currencies (`docs/qcode_mapping.md`). So any metric that *sums* `$` across
+> instruments — `asset_impact(by="tier"/"asset_class")`, the `*_bps_nw` / `$` columns of
+> `order_impact_stats` — is meaningless until the pieces share a unit. Put every summary
+> into common USD notional with two per-order constant scales, **in order**:
+> 1. **`apply_multiplier(summary, mults)`** — ×contract multiplier
+>    (`data/raw/contract_multipliers.csv`, e.g. ES = `$50`/pt, bond futures = `1000`):
+>    quote-points → native currency.
+> 2. **`to_usd(summary, fx, ccy_map)`** — ×daily FX rate (`data/raw/fx_rates.csv`,
+>    as-of by date; USD passes through at 1.0): native currency → USD.
+>
+> Both scale numerator and denominator together, so all **bps ratios** (per-order,
+> per-`qcode`, and the paired t-tests) are **unchanged**; only cross-asset sums move —
+> a high-multiplier / stronger-currency contract now carries proportionally more
+> notional weight in a pool. The back-test notebook applies both to every summary
+> before building the tier tables. (`by="qcode"` is single-unit, so pooling there is
+> already valid — the scales only re-weight *across* qcodes.)
+
 Finally there's a **shape** diagnostic — **participation dispersion** — for how
 flat a schedule's intraday participation is: the volume-weighted volatility
 `σ_p = sqrt(Σ v_k (p_k − P)²)` of per-bin participation `p_k = q_filled_k/volume_k`
@@ -376,13 +396,29 @@ perfect volume-tracker has `p_k = P` everywhere so `σ_p ≈ 0` — `omniscient_
 is the sanity check. `participation_dispersion(fills)` gives it per order and
 `participation_stats(disp, label)` the mean/median CV per strategy.
 
+**Pairwise significance tests.** To ask whether two strategies genuinely differ
+(not just on a pooled average), `paired_impact_ttest(summaries, tiers, bucket=…)`
+and `paired_participation_ttest(fills, tiers, bucket=…)` run a **paired t-test**
+(`scipy.stats.ttest_rel`) for every strategy pair within each impact tier: orders
+are matched on `order_id` (all strategies share the trade list), and the per-order
+metric is compared — the per-order **total-impact bps**
+(`order_impact / impact_notional × 1e4`, the pairable analogue of the pooled
+`asset_impact` bps; `metric=` also allows `realised_bps` / `opportunity_bps`) or the
+per-order **participation CV**. Each draws one `N×N` matrix per tier
+(`N = len(summaries)`, never hardcoded), colour-coded by p-value (green `p<0.01`,
+orange `0.01≤p<0.05`, grey = not significant) and annotated with `t` / `p` / paired
+`n`; `t>0` means the row strategy's metric is higher than the column's. Both are thin
+wrappers over the general `paired_ttest_panels(by_strat, strats, groups, …)`
+(matplotlib/scipy are imported lazily, so they're only needed when these are called).
+
 > **Full column-by-column reference:** see
 > [`docs/execution_metrics.md`](docs/execution_metrics.md). It documents every
 > field `summarise_fills` produces and, importantly, explains how the three
 > "quality" numbers (`total_cost`, `exec_slippage_bps`, `is_bps`) differ.
 
-*(Cross-strategy comparison and evaluation are out of scope for now — we're
-still building the strategies, not yet ranking them.)*
+*(Cross-strategy **ranking** is still out of scope — we're building strategies, not
+yet crowning one — but the paired t-tests above are the first cut at pairwise
+comparison: which differences are real, tier by tier.)*
 
 ---
 
