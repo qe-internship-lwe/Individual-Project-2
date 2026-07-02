@@ -11,10 +11,12 @@ into three groups:
 
 - **Deployable** (no future information): **TWAP**; a historical-volume VWAP
   (`vwap_static`); a cost-minimising liquidity/spread allocator (`liq_spr_static`);
-  and three **adaptive** schedules that react to volume as the day unfolds — an AR(1)
+  three **adaptive** schedules that react to volume as the day unfolds — an AR(1)
   volume-surprise tilt (`vwap_adaptive`), a K-factor Kalman filter on the latent
   daily volume factor (`vwap_factor`), and a per-pair OLS forecast
-  (`adaptive_volume_ols`).
+  (`adaptive_volume_ols`); and two **dynamic spread × volume cost-minimisers** that
+  forecast spread *and* volume live and re-optimise each bin (`spread_factor_vol_ols`,
+  `spread_factor_vol_factor`).
 - **Lookahead benchmarks** (allowed to see the realised day — *not* tradeable):
   `omniscient_vwap`, `omniscient_liq_spr`, and the full `omniscient` — the bars the
   deployable strategies are measured against.
@@ -124,7 +126,8 @@ slice:
   `omniscient*` benchmarks) commit a fixed plan up front that sums exactly to the
   order quantity. If a bin under-fills (the `2 × volume` cap or a dead bin), that
   quantity is simply lost — they do **not** chase it.
-- **Dynamic** schedules (`vwap_adaptive`, `vwap_factor`, `adaptive_volume_ols`)
+- **Dynamic** schedules (`vwap_adaptive`, `vwap_factor`, `adaptive_volume_ols`,
+  `spread_factor_vol_ols`, `spread_factor_vol_factor`)
   re-plan as the day unfolds and **carry forward**: each
   bin requests a *proportion of the lots still to fill*, and `remaining` is
   decremented by what **actually filled** (not what was requested). A slice the
@@ -259,8 +262,8 @@ penalty relaxes. The schedule participates in proportion to `volume_tilde` over 
 lots still to fill (toggle with `ce_adjust`). It's strictly causal (bin `k` uses only
 volume `< k`), carries forward, and rounds to whole lots. For one factor the update
 is exactly the scalar Kalman recursion; for K>1 the forecast is invariant to factor
-rotation, so loadings need no rotation. **`N_FACTORS`** and **`LOOKBACK_DAYS`** are
-notebook parameters (the latter also sets the minimum history, so orders in a
+rotation, so loadings need no rotation. **`N_FACTORS_VOLUME`** and **`LOOKBACK_DAYS`**
+are notebook parameters (the latter also sets the minimum history, so orders in a
 qcode's first `LOOKBACK_DAYS` trading days are dropped). Falls back to TWAP when an
 order has no factor model.
 
@@ -286,6 +289,41 @@ baseline (`M̂=0`, `r²=σ_m²`). Dynamic, carries forward, whole lots. Uses the
 only the latest bin, so it tends to under-perform `vwap_factor` where the level factor
 dominates (long-lag volume correlations don't decay), but it's a simpler, transparent
 baseline.
+
+### Dynamic spread × volume cost-minimisers — `spread_factor_vol_ols`, `spread_factor_vol_factor`
+
+Everything above tracks **volume only** (VWAP-style participation, spread-blind). These
+two strategies are the **dynamic, spread-aware** generalisation of `liq_spr_static`:
+they forecast **both** the remaining spread and the remaining volume as the day unfolds
+and, at every bin, re-solve the fill model's convex cost optimiser (`_solve_mu`,
+`q_m* = V_m·max(0, μ/(MARG_COEF·s_m) − THRESH_RATIO)²`) over the lots still to fill —
+so the schedule concentrates in bins expected to be **both liquid and tight-spread**.
+With a flat spread this collapses back to VWAP; the tilt scales with how much the
+intraday spread varies (negligible for ES, large for wide/variable-spread names).
+
+- **Spread** is always forecast by a **factor-Kalman** filter on intraday **log-spread**
+  deviations of `s = twa_ask − twa_bid` (`build_spread_factor_curves` — the exact spread
+  analogue of `build_factor_curves`, same MLE factor analysis on the trailing window,
+  lookahead-free). Intraday spread is **far more low-rank than volume** (the U-shaped
+  liquidity curve is very stable day to day — a single factor explains ~80% of log-spread
+  variance on average vs ~49% for volume), so `N_FACTORS_SPREAD = 1` suffices for most
+  instruments.
+- **Volume** is forecast by whichever model the name says: `spread_factor_vol_ols` uses
+  the pairwise **OLS** (`build_ols_curves`), `spread_factor_vol_factor` uses the volume
+  **factor-Kalman** (`build_factor_curves`, the `vwap_factor` filter). The strategy name
+  reads `spread_<method> _ vol_<method>`.
+
+When `ce_adjust` (default on) the point forecasts are replaced by their **lognormal
+certainty equivalents** before optimising, both from the same MGF but with opposite
+sign because of how each enters the cost: volume appears as `V^{-1/2}` (**convex**), so
+an uncertain bin is **shrunk** `Ṽ_m = V̂_m·exp(−r²_v/4)` (as in `vwap_factor`); spread
+appears **linearly**, so expected-cost minimisation uses the **mean** spread
+`E[s] = exp(μ + r²/2)`, i.e. an uncertain bin is **inflated** `s̃_m = ŝ_m·exp(+r²_s/2)`
+and the optimiser steers away from bins whose tight spread it isn't sure about. (The
+spread term is mild in practice — log-spread variance is small.) Both are strictly
+causal, dynamic (carry forward, whole lots), and fall back to TWAP when an order lacks
+**either** a spread or a volume model. `N_FACTORS_SPREAD` and `N_FACTORS_VOLUME` (and the
+shared `LOOKBACK_DAYS`) are notebook parameters.
 
 ---
 

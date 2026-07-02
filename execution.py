@@ -89,10 +89,13 @@ __all__ = [
     "participation_dispersion",
     "participation_stats",
     "build_factor_curves",
+    "build_spread_factor_curves",
     "certainty_equivalent_volume",
     "vwap_factor",
     "build_ols_curves",
     "adaptive_volume_ols",
+    "spread_factor_vol_ols",
+    "spread_factor_vol_factor",
     "SLIPPAGE_BASE",
     "SLIPPAGE_COEF",
     "FILL_CAP_MULTIPLE",
@@ -1088,24 +1091,48 @@ def vwap_adaptive(bins: pl.DataFrame, quantity: float, *,
 
 
 def _build_window_models(history: pl.DataFrame, needed: pl.DataFrame, *,
-                         window_days: int, fit_fn) -> dict:
-    """Trailing-window driver shared by the per-order volume models (lookahead-free).
+                         window_days: int, fit_fn, value: str = "volume") -> dict:
+    """Trailing-window driver shared by the per-order volume/spread models (lookahead-free).
 
     For each ``(qcode, date)`` in ``needed`` it slices that qcode's previous
-    ``window_days`` trading days (the dense (date x bin) volume grid, **strictly
-    before** the date - the day itself is never in the window) and calls
-    ``fit_fn(window_vol, bintimes)``; non-``None`` results are keyed by
+    ``window_days`` trading days (the dense (date x bin) grid, **strictly before**
+    the date - the day itself is never in the window) and calls
+    ``fit_fn(window_mat, bintimes)``; non-``None`` results are keyed by
     ``(qcode, date)``. Pooled at the qcode level (intraday shape is a qcode property).
+
+    ``value`` selects what the ``(D_days, N_bins)`` matrix holds, so the same MLE /
+    OLS ``fit_fn`` can model either quantity's intraday **log-deviations**:
+
+    * ``"volume"`` (default) - the qcode's **summed** volume per ``(date, bin)``;
+    * ``"spread"``           - the **volume-weighted mean** spread ``twa_ask - twa_bid``
+      per ``(date, bin)`` (same daily aggregation as :func:`build_rolling_curves`).
+
+    Both feed :func:`_fit_factor_model` / :func:`_fit_ols_model` unchanged: those treat
+    a matrix entry ``> 0`` as an observed value to log-deseasonalise and ``<= 0`` /
+    missing as a no-observation day (imputed at the bin's log-mean).
     """
     date_col = "date" if "date" in needed.columns else DATE_COL
     want: dict = {}
     for qc, dt in needed.select(QCODE_COL, date_col).unique().iter_rows():
         want.setdefault(qc, set()).add(dt)
 
-    h = (history.select(QCODE_COL, DATE_COL, BIN_TIME_COL, VOLUME_COL)
-         .filter(pl.col(QCODE_COL).is_in(list(want.keys()))))
-    daily = h.group_by(QCODE_COL, DATE_COL, BIN_TIME_COL).agg(
-        pl.col(VOLUME_COL).cast(pl.Float64).fill_null(0.0).sum().alias("vol"))
+    if value == "spread":
+        h = (history.select(QCODE_COL, DATE_COL, BIN_TIME_COL, VOLUME_COL, ASK_COL, BID_COL)
+             .filter(pl.col(QCODE_COL).is_in(list(want.keys())))
+             .with_columns(pl.col(VOLUME_COL).cast(pl.Float64).fill_null(0.0).alias("_v"),
+                           (pl.col(ASK_COL) - pl.col(BID_COL)).alias("_spr")))
+        # volume-weighted mean spread per (qcode, date, bin) (fall back to plain mean
+        # on zero-volume days); non-positive/absent spreads are dropped downstream.
+        daily = h.group_by(QCODE_COL, DATE_COL, BIN_TIME_COL).agg(
+            pl.when(pl.col("_v").sum() > 0)
+            .then((pl.col("_spr") * pl.col("_v")).sum() / pl.col("_v").sum())
+            .otherwise(pl.col("_spr").mean())
+            .alias("vol"))
+    else:
+        h = (history.select(QCODE_COL, DATE_COL, BIN_TIME_COL, VOLUME_COL)
+             .filter(pl.col(QCODE_COL).is_in(list(want.keys()))))
+        daily = h.group_by(QCODE_COL, DATE_COL, BIN_TIME_COL).agg(
+            pl.col(VOLUME_COL).cast(pl.Float64).fill_null(0.0).sum().alias("vol"))
 
     curves: dict = {}
     for qc, want_dates in want.items():
@@ -1246,6 +1273,50 @@ def build_factor_curves(history: pl.DataFrame, needed: pl.DataFrame, *,
         keys without it are omitted, so :func:`vwap_factor` falls back to TWAP.
     """
     return _build_window_models(history, needed, window_days=window_days,
+                                fit_fn=lambda w, bt: _fit_factor_model(w, bt, n_factors))
+
+
+def build_spread_factor_curves(history: pl.DataFrame, needed: pl.DataFrame, *,
+                               window_days: int = 22, n_factors: int = 1) -> dict:
+    """Per-order **factor model** of intraday log-**spread** deviations (lookahead-free).
+
+    The spread analogue of :func:`build_factor_curves`: for every ``(qcode, date)``
+    order key in ``needed`` it fits an ``n_factors``-factor model (see
+    :func:`_fit_factor_model`) to the intraday **log-deviations of the bid-ask spread**
+    ``s = twa_ask - twa_bid`` over **only** that qcode's previous ``window_days``
+    trading days, strictly before the order date (the same day is never in the window).
+    The daily per-bin spread is the volume-weighted mean across the qcode's contract
+    months (as in :func:`build_rolling_curves`); bins that seldom quote a positive
+    spread are marked inactive.
+
+    Same estimator and return shape as :func:`build_factor_curves` - only the modelled
+    quantity differs - so :func:`spread_factor_vol_ols` / :func:`spread_factor_vol_factor`
+    run the identical sequential Kalman update on **spread** surprises to forecast each
+    remaining bin's spread ``s_hat_m = exp(L_m + lambda_m . mu)``. Intraday spread has a
+    much stronger single-factor structure than volume (the U-shaped liquidity curve is
+    very stable day to day), so ``n_factors = 1`` already captures most instruments.
+
+    Parameters
+    ----------
+    history : pl.DataFrame
+        Full bin history (``qcode``, ``publication_date``, ``bin_start_time``,
+        ``volume``, ``twa_ask``, ``twa_bid``).
+    needed : pl.DataFrame
+        Order keys to emit models for; needs ``qcode`` and a date column
+        (``date`` or ``publication_date``).
+    window_days : int, default 22
+        Trailing trading-day window (per qcode), excluding the order day.
+    n_factors : int, default 1
+        Number of latent **spread** factors ``K`` (capped at the usable bin/day count).
+
+    Returns
+    -------
+    dict
+        ``{(qcode, date): factor_model_dict}`` of log-spread models for keys with enough
+        prior history; keys without it are omitted, so the consuming strategies fall
+        back to TWAP.
+    """
+    return _build_window_models(history, needed, window_days=window_days, value="spread",
                                 fit_fn=lambda w, bt: _fit_factor_model(w, bt, n_factors))
 
 
@@ -1575,6 +1646,280 @@ def adaptive_volume_ols(bins: pl.DataFrame, quantity: float, *,
         if fillable[k]:
             remaining -= min(q, cap[k])
     return pl.Series("q_requested", sched, dtype=pl.Float64)
+
+
+def _align_factor_model(model: dict, times: Sequence):
+    """Align a factor model's per-bin arrays to this day's bin order.
+
+    Returns ``(K, L, lam (n,K), su2 (n), active (n))`` where ``active`` marks bins the
+    model can forecast (finite baseline and positive idiosyncratic variance). Bins with
+    no model entry get ``L=-inf``, ``lam=0``, ``su2=NaN`` (inactive). Shared by the
+    spread Kalman (always) and the volume Kalman (factor variant).
+    """
+    idx = {t: j for j, t in enumerate(model["times"])}
+    sel = [idx.get(t, -1) for t in times]
+    K = int(model["n_factors"])
+    L = np.array([model["L"][j] if j >= 0 else -np.inf for j in sel], dtype=float)
+    lam = np.array([model["lam"][j] if j >= 0 else np.zeros(K) for j in sel], dtype=float)
+    su2 = np.array([model["su2"][j] if j >= 0 else np.nan for j in sel], dtype=float)
+    active = np.isfinite(su2) & (su2 > 0) & np.isfinite(L)
+    return K, L, lam, su2, active
+
+
+def _align_ols_model(model: dict, times: Sequence):
+    """Align a pairwise-OLS model to this day's bin order (see :func:`adaptive_volume_ols`).
+
+    Returns ``(C, diagC, D, Lc, L (n), col (n), active (n))`` where ``C = M^T M`` is the
+    cross-moment matrix over the window's active bins, ``Lc`` their log-mean baselines,
+    ``L`` the per-day-bin baseline and ``col`` maps each day bin to its column in ``C``
+    (``-1`` if absent). ``active`` marks bins present in ``C`` with a finite baseline.
+    """
+    C = model["M"].T @ model["M"]
+    diagC = np.diag(C).copy()
+    D = int(model["D"])
+    active_full = np.where(model["active"])[0]
+    Lc = model["L"][active_full]
+    colpos = {int(fi): a for a, fi in enumerate(active_full)}
+    idx = {t: j for j, t in enumerate(model["times"])}
+    sel = [idx.get(t, -1) for t in times]
+    L = np.array([model["L"][j] if j >= 0 else -np.inf for j in sel], dtype=float)
+    col = np.array([colpos.get(j, -1) if j >= 0 else -1 for j in sel], dtype=int)
+    active = (col >= 0) & np.isfinite(L)
+    return C, diagC, D, Lc, L, col, active
+
+
+def _dyn_spread_vol_schedule(bins: pl.DataFrame, total_lots: int, spread_model: dict,
+                             vol_model: dict, *, vol_kind: str, ce_adjust: bool) -> np.ndarray:
+    """Shared engine for the dynamic spread x volume cost-minimising strategies.
+
+    Runs, in lockstep down the day, a sequential Kalman filter on **log-spread**
+    surprises (from ``spread_model``, always a factor model) and a **log-volume**
+    forecaster (``vol_kind="factor"`` -> a second Kalman filter; ``"ols"`` -> the Markov
+    pairwise-OLS of :func:`adaptive_volume_ols`). At each bin ``k`` it re-forecasts every
+    remaining bin's spread ``s_hat_m`` and volume ``V_hat_m``, feeds them into the fill
+    model's convex cost optimiser (:func:`_solve_mu`: ``q_m* = V_m (max(0, mu/(MARG_COEF
+    s_m) - THRESH_RATIO))^2``) over the lots **still to fill**, and executes bin ``k``'s
+    optimal share - the dynamic, spread-aware generalisation of :func:`liq_spr_static`.
+
+    Both forecasts are strictly causal (bin ``k`` uses only bins ``< k``). When
+    ``ce_adjust`` the point forecasts are replaced by their lognormal certainty
+    equivalents before optimising:
+
+    * **volume** enters the cost through ``V^{-1/2}`` (convex), so an uncertain bin is
+      *shrunk*: ``V_tilde_m = V_hat_m * exp(-r2_v,m / 4)`` (as in :func:`vwap_factor`);
+    * **spread** enters the cost **linearly**, so expected-cost minimisation uses the
+      *mean* spread ``E[s] = exp(mu + r2/2)``, i.e. an uncertain bin is *inflated*:
+      ``s_tilde_m = s_hat_m * exp(+r2_s,m / 2)`` - so the optimiser steers away from bins
+      whose tight spread it is unsure about. (Log-spread variance is small - spread is
+      far more stable intraday than volume - so this term is mild in practice.)
+
+    Returns the per-bin whole-lot request array (unfilled lots carried forward; the last
+    active bin sweeps the residual). Falls back to :func:`twap_schedule` if no bin has
+    both a spread and a volume forecast.
+    """
+    n = bins.height
+    times = bins.get_column(BIN_TIME_COL).to_list()
+
+    # spread: always a factor model; volume: factor Kalman or pairwise-OLS
+    Ks, Ls, lam_s, su2_s, active_s = _align_factor_model(spread_model, times)
+    if vol_kind == "factor":
+        Kv, Lv, lam_v, su2_v, active_v = _align_factor_model(vol_model, times)
+    else:
+        C, diagC, D, Lc, Lv, col, active_v = _align_ols_model(vol_model, times)
+
+    active = active_s & active_v
+    if not active.any():
+        return twap_schedule(bins, total_lots).to_numpy()
+
+    vr = (bins.get_column(VOLUME_COL).cast(pl.Float64).fill_null(0.0).fill_nan(0.0).to_numpy())
+    sr = (bins.get_column(ASK_COL).cast(pl.Float64).to_numpy()
+          - bins.get_column(BID_COL).cast(pl.Float64).to_numpy())     # realised spread
+    fillable, cap = _fill_capacity(bins)
+    last_idx = int(np.max(np.where(active)))
+    idxrange = np.arange(n)
+
+    mu_s = np.zeros(Ks); P_s = np.eye(Ks)
+    base_s = np.where(active_s, np.exp(np.clip(Ls, -50.0, 50.0)), 0.0)
+    if vol_kind == "factor":
+        mu_v = np.zeros(Kv); P_v = np.eye(Kv)
+        base_v = np.where(active_v, np.exp(np.clip(Lv, -50.0, 50.0)), 0.0)
+    else:
+        j_col = -1; m_obs = 0.0
+
+    sched = np.zeros(n, dtype=float)
+    remaining = float(total_lots)
+    for k in range(n):
+        # --- causal measurement updates from the just-completed bin (k-1) ---
+        if k >= 1:
+            if active_s[k - 1] and sr[k - 1] > 0:                     # spread factor update
+                y = (math.log(sr[k - 1]) - Ls[k - 1]) - float(lam_s[k - 1] @ mu_s)
+                Pl = P_s @ lam_s[k - 1]
+                S = float(lam_s[k - 1] @ Pl + su2_s[k - 1])
+                if S > 0:
+                    Kg = Pl / S
+                    mu_s = mu_s + Kg * y
+                    P_s = P_s - np.outer(Kg, Pl)
+            if vol_kind == "factor":                                  # volume factor update
+                if active_v[k - 1] and vr[k - 1] > 0:
+                    y = (math.log(vr[k - 1]) - Lv[k - 1]) - float(lam_v[k - 1] @ mu_v)
+                    Pl = P_v @ lam_v[k - 1]
+                    S = float(lam_v[k - 1] @ Pl + su2_v[k - 1])
+                    if S > 0:
+                        Kg = Pl / S
+                        mu_v = mu_v + Kg * y
+                        P_v = P_v - np.outer(Kg, Pl)
+            elif active_v[k - 1] and vr[k - 1] > 0:                   # volume OLS conditioning bin
+                j_col = int(col[k - 1])
+                m_obs = math.log(vr[k - 1]) - Lv[k - 1]
+        if remaining <= 0.5:
+            break
+        if k == last_idx:
+            q = remaining                                            # sweep up the residual
+        elif not active[k]:
+            q = 0.0
+        else:
+            # spread forecast + predictive log-variance for every bin (current belief)
+            shat = base_s * np.exp(np.clip(lam_s @ mu_s, -50.0, 50.0))
+            r2s = ((lam_s @ P_s) * lam_s).sum(axis=1) + np.nan_to_num(su2_s, nan=0.0)
+            # volume forecast + predictive log-variance
+            if vol_kind == "factor":
+                vhat = base_v * np.exp(np.clip(lam_v @ mu_v, -50.0, 50.0))
+                r2v = ((lam_v @ P_v) * lam_v).sum(axis=1) + np.nan_to_num(su2_v, nan=0.0)
+            else:
+                if j_col >= 0 and diagC[j_col] > 0:
+                    ck = diagC[j_col]
+                    mhat = (C[j_col, :] / ck) * m_obs
+                    sig2 = np.maximum(diagC - C[j_col, :] ** 2 / ck, 0.0) / max(D - 1, 1)
+                    r2c = sig2 + (sig2 / ck) * m_obs ** 2
+                else:                                                # no observation yet
+                    mhat = np.zeros(C.shape[0])
+                    r2c = diagC / max(D - 1, 1)
+                vt = np.exp(np.clip(Lc + mhat, -50.0, 50.0))
+                vhat = np.zeros(n); r2v = np.zeros(n)
+                vhat[active_v] = vt[col[active_v]]
+                r2v[active_v] = r2c[col[active_v]]
+            # certainty-equivalent forecasts (lognormal): shrink uncertain volume
+            # (convex V^-1/2 cost), inflate uncertain spread (linear-in-s expected cost)
+            if ce_adjust:
+                vopt = certainty_equivalent_volume(vhat, r2v)
+                sopt = shat * np.exp(0.5 * np.clip(r2s, 0.0, 100.0))
+            else:
+                vopt, sopt = vhat, shat
+            # cost-optimal split of the lots STILL TO FILL over remaining active bins
+            arem = active & (idxrange >= k)
+            q_star = np.zeros(n)
+            q_star[arem] = _solve_mu(remaining, sopt[arem], vopt[arem])
+            q = min(float(round(q_star[k])), remaining)
+        sched[k] = q
+        if fillable[k]:
+            remaining -= min(q, cap[k])
+    return sched
+
+
+def _dyn_spread_vol(bins: pl.DataFrame, quantity: float, *, spread_curves: dict,
+                    vol_curves: dict, vol_kind: str, ce_adjust: bool) -> pl.Series:
+    """Entry point shared by the dynamic spread x volume strategies (see wrappers)."""
+    n = bins.height
+    if n == 0:
+        return pl.Series("q_requested", [], dtype=pl.Float64)
+    total_lots = int(round(float(quantity)))
+    if total_lots <= 0:
+        return pl.Series("q_requested", [0.0] * n, dtype=pl.Float64)
+
+    key = None
+    if QCODE_COL in bins.columns and DATE_COL in bins.columns:
+        key = (bins.get_column(QCODE_COL)[0], bins.get_column(DATE_COL)[0])
+    spread_model = spread_curves.get(key) if key is not None else None
+    vol_model = vol_curves.get(key) if key is not None else None
+    if spread_model is None or vol_model is None:
+        return twap_schedule(bins, total_lots)
+
+    sched = _dyn_spread_vol_schedule(bins, total_lots, spread_model, vol_model,
+                                     vol_kind=vol_kind, ce_adjust=ce_adjust)
+    return pl.Series("q_requested", sched, dtype=pl.Float64)
+
+
+def spread_factor_vol_ols(bins: pl.DataFrame, quantity: float, *, spread_curves: dict,
+                          vol_curves: dict, ce_adjust: bool = True, **_: object) -> pl.Series:
+    """Dynamic cost-minimiser: **spread = factor Kalman**, **volume = pairwise OLS**.
+
+    Forecasts each remaining bin's **spread** with the sequential factor-Kalman update
+    on log-spread surprises (from :func:`build_spread_factor_curves`) and its **volume**
+    with the Markov pairwise-OLS regression on the latest observed bin (from
+    :func:`build_ols_curves`, as in :func:`adaptive_volume_ols`), then schedules the lots
+    still to fill by **minimising the fill model's slippage cost** over both forecasts
+    (:func:`_solve_mu` - the same convex optimiser as :func:`liq_spr_static`, but on live,
+    per-bin-updated forecasts instead of static curves). Whereas :func:`vwap_factor` /
+    :func:`adaptive_volume_ols` only track volume (spread-blind, VWAP-style), this tilts
+    the schedule toward bins expected to be both **liquid and tight-spread**.
+
+    **Dynamic**: strictly causal, carries unfilled lots forward, whole lots throughout;
+    the last active bin sweeps the residual. Falls back to :func:`twap_schedule` when no
+    ``(qcode, date)`` spread **or** volume model exists.
+
+    Parameters
+    ----------
+    bins : pl.DataFrame
+        Bins for one (security, date) with ``qcode``, ``publication_date``,
+        ``bin_start_time``, ``volume``, ``vwap``, ``twa_ask``, ``twa_bid``.
+    quantity : float
+        Total lots (rounded to whole lots).
+    spread_curves : dict
+        ``{(qcode, date): factor_model}`` from :func:`build_spread_factor_curves`.
+    vol_curves : dict
+        ``{(qcode, date): ols_model}`` from :func:`build_ols_curves`.
+    ce_adjust : bool, default True
+        Apply the lognormal certainty-equivalent forecasts before optimising (shrink
+        uncertain volume ``exp(-r2/4)``, inflate uncertain spread ``exp(+r2/2)``); see
+        :func:`_dyn_spread_vol_schedule`.
+
+    Returns
+    -------
+    pl.Series
+        Integer-valued float series of length ``len(bins)``; unfilled lots carried
+        forward (requested total ``>= round(quantity)``).
+    """
+    return _dyn_spread_vol(bins, quantity, spread_curves=spread_curves,
+                           vol_curves=vol_curves, vol_kind="ols", ce_adjust=ce_adjust)
+
+
+def spread_factor_vol_factor(bins: pl.DataFrame, quantity: float, *, spread_curves: dict,
+                             vol_curves: dict, ce_adjust: bool = True, **_: object) -> pl.Series:
+    """Dynamic cost-minimiser: **spread = factor Kalman**, **volume = factor Kalman**.
+
+    Identical to :func:`spread_factor_vol_ols` except the **volume** forecast is a second
+    sequential factor-Kalman update on log-volume surprises (from
+    :func:`build_factor_curves`, exactly the :func:`vwap_factor` filter) rather than the
+    Markov OLS. Both the spread and the volume beliefs update on each bin's surprise and
+    feed the fill model's convex cost optimiser (:func:`_solve_mu`) over the lots still to
+    fill, so the schedule concentrates in bins expected to be liquid **and** tight-spread.
+
+    **Dynamic**: strictly causal, carries unfilled lots forward, whole lots throughout;
+    the last active bin sweeps the residual. Falls back to :func:`twap_schedule` when no
+    ``(qcode, date)`` spread **or** volume model exists.
+
+    Parameters
+    ----------
+    bins : pl.DataFrame
+        Bins for one (security, date); see :func:`spread_factor_vol_ols`.
+    quantity : float
+        Total lots (rounded to whole lots).
+    spread_curves : dict
+        ``{(qcode, date): factor_model}`` from :func:`build_spread_factor_curves`.
+    vol_curves : dict
+        ``{(qcode, date): factor_model}`` from :func:`build_factor_curves`.
+    ce_adjust : bool, default True
+        Apply the lognormal certainty-equivalent forecasts before optimising (see
+        :func:`spread_factor_vol_ols`).
+
+    Returns
+    -------
+    pl.Series
+        Integer-valued float series of length ``len(bins)``; unfilled lots carried
+        forward.
+    """
+    return _dyn_spread_vol(bins, quantity, spread_curves=spread_curves,
+                           vol_curves=vol_curves, vol_kind="factor", ce_adjust=ce_adjust)
 
 
 def _solve_omniscient_q(total_lots: int, base: np.ndarray, s: np.ndarray,
